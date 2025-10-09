@@ -788,6 +788,20 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 					return fmt.Errorf("failed to copy parent upperdir to new snapshot upperdir: %w, from %s to %s", err, parent_upperdir, td)
 				}
 				log.G(ctx).Debug("Copied parent upperdir to new snapshot upperdir:", td)
+
+				// Create test data directory with 100M data
+				testDataDir := filepath.Join(td, "test_data")
+				if err := os.MkdirAll(testDataDir, 0755); err != nil {
+					log.G(ctx).WithError(err).Warn("Failed to create test data directory")
+				} else {
+					// Create a 100M test file
+					testFile := filepath.Join(testDataDir, "test_100m.dat")
+					if err := createTestFile(ctx, testFile, 100*1024*1024); err != nil {
+						log.G(ctx).WithError(err).Warn("Failed to create test data file")
+					} else {
+						log.G(ctx).Info("Created test data file:", testFile)
+					}
+				}
 			}
 
 			log.G(ctx).Debug("Prepared LVM directory for snapshot:", td, "with logical volume name:", lvName)
@@ -1029,6 +1043,59 @@ func (o *Snapshotter) upperPath(id string) string {
 
 func (o *Snapshotter) workPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "work")
+}
+
+// createTestFile creates a test file with specified size
+// If disk space is insufficient, it writes as much as possible and logs the actual size
+func createTestFile(ctx context.Context, filename string, size int64) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create test file: %w", err)
+	}
+	defer file.Close()
+
+	// Write data in chunks to avoid memory issues
+	const chunkSize = 1024 * 1024 // 1MB chunks
+	chunk := make([]byte, chunkSize)
+
+	// Fill chunk with test data
+	for i := range chunk {
+		chunk[i] = byte(i % 256)
+	}
+
+	remaining := size
+	bytesWritten := int64(0)
+
+	for remaining > 0 {
+		writeSize := int64(chunkSize)
+		if remaining < int64(chunkSize) {
+			writeSize = remaining
+		}
+
+		if _, err := file.Write(chunk[:writeSize]); err != nil {
+			// Disk space insufficient, but we've written as much as possible
+			if bytesWritten > 0 {
+				// Log that we couldn't write the full requested size
+				log.G(ctx).Warnf("Only wrote %d bytes to %s instead of requested %d bytes (disk space insufficient)",
+					bytesWritten, filename, size)
+				// Don't return error, just break the loop
+				break
+			}
+			// If we couldn't write anything at all, that's a real error
+			return fmt.Errorf("failed to write test data: %w", err)
+		}
+
+		bytesWritten += writeSize
+		remaining -= writeSize
+	}
+
+	// Sync whatever we managed to write
+	if err := file.Sync(); err != nil {
+		log.G(ctx).Warnf("Failed to sync file %s: %v", filename, err)
+		// Don't return error for sync failure, file content is still written
+	}
+
+	return nil
 }
 
 // Close closes the snapshotter

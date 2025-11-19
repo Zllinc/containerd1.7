@@ -904,8 +904,8 @@ func RemoveDevbox(ctx context.Context, Key string) (string, error) {
 }
 
 // IDMap returns all the IDs mapped to their key
-func GetDevboxLvNames(ctx context.Context) (map[string]string, error) {
-	m := map[string]string{}
+func GetDevboxLvNames(ctx context.Context) (map[string]struct{}, error) {
+	m := make(map[string]struct{})
 	if err := withDevboxBucket(ctx, func(ctx context.Context, _ *bolt.Bucket, dbkt *bolt.Bucket) error {
 		return dbkt.ForEachBucket(func(k []byte) error {
 			// skip non buckets
@@ -914,9 +914,8 @@ func GetDevboxLvNames(ctx context.Context) (map[string]string, error) {
 				return nil
 			}
 			lvName := v.Get(DevboxKeyLvName)
-			path := v.Get(DevboxKeyPath)
 			if len(lvName) > 0 {
-				m[string(lvName)] = string(path)
+				m[string(lvName)] = struct{}{}
 			}
 			return nil
 		})

@@ -160,6 +160,14 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 
 	labels := c.getLabels(ctx, ref)
 
+	// if snapshotter is devbox, add the pinned image label
+	if snapshotter == "devbox" {
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels[crilabels.PinnedImageLabelKey] = crilabels.PinnedImageLabelValue
+	}
+
 	pullOpts := []containerd.RemoteOpt{
 		containerd.WithSchema1Conversion, //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
 		containerd.WithResolver(resolver),

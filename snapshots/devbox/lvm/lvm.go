@@ -18,6 +18,7 @@ package lvm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,6 +26,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -262,25 +265,102 @@ func buildLVMDestroyArgs(vol *apis.LVMVolume) []string {
 	return LVMVolArg
 }
 
-// RunCommandSplit is a wrapper function to run a command and receive its
+// RunCommandSplit is a wrapper function to run a command with timeout and receive its
 // STDERR and STDOUT streams in separate []byte vars.
 func RunCommandSplit(command string, args ...string) ([]byte, []byte, error) {
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), CommandTimeout)
+	defer cancel()
+
 	var cmdStdout bytes.Buffer
 	var cmdStderr bytes.Buffer
 
-	cmd := exec.Command(command, args...)
+	// Use CommandContext to support timeout
+	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Stdout = &cmdStdout
 	cmd.Stderr = &cmdStderr
-	err := cmd.Run()
 
-	output := cmdStdout.Bytes()
-	error_output := cmdStderr.Bytes()
-
-	if len(error_output) > 0 {
-		klog.Warningf("lvm: said into stderr: %s", error_output)
+	// Set process group to ensure child processes are also terminated
+	// Setpgid: true means the child process will create a new process group
+	// This allows us to kill all related processes (including children) when timeout occurs
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true, // Create new process group, PGID = child process PID
 	}
 
-    return output, error_output, err
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("failed to start command %s: %w", command, err)
+	}
+
+	// Wait for command to complete
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		// Command completed normally (success or failure)
+		output := cmdStdout.Bytes()
+		error_output := cmdStderr.Bytes()
+
+		if len(error_output) > 0 {
+			klog.Warningf("lvm: said into stderr: %s", error_output)
+		}
+
+		return output, error_output, err
+
+	case <-ctx.Done():
+		// Timeout occurred
+		if cmd.Process != nil {
+			klog.Warningf("lvm: command %s %v timed out after %v, attempting to kill",
+				command, args, CommandTimeout)
+
+			// Get process group ID
+			pgid, err := syscall.Getpgid(cmd.Process.Pid)
+			if err != nil {
+				klog.Warningf("lvm: failed to get process group ID for PID %d: %v",
+					cmd.Process.Pid, err)
+				// If we can't get process group, kill the process directly
+				cmd.Process.Signal(syscall.SIGTERM)
+			} else {
+				// Send SIGTERM to the entire process group (negative PID means process group)
+				if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
+					klog.Warningf("lvm: failed to send SIGTERM to process group %d: %v", pgid, err)
+				}
+			}
+
+			// Wait for graceful termination (up to 2 seconds)
+			select {
+			case <-done:
+				// Process has exited
+				klog.Infof("lvm: command %s terminated gracefully after SIGTERM", command)
+			case <-time.After(2 * time.Second):
+				// Still not exited after 2 seconds, send SIGKILL to force termination
+				klog.Warningf("lvm: command %s did not terminate after SIGTERM, sending SIGKILL", command)
+
+				if pgid > 0 {
+					// Send SIGKILL to the entire process group
+					syscall.Kill(-pgid, syscall.SIGKILL)
+				} else {
+					// If we couldn't get process group earlier, kill the process directly
+					cmd.Process.Kill()
+				}
+
+				// Wait for the process to be killed
+				<-done
+			}
+		}
+
+		output := cmdStdout.Bytes()
+		error_output := cmdStderr.Bytes()
+
+		if len(error_output) > 0 {
+			klog.Warningf("lvm: command %s stderr output: %s", command, error_output)
+		}
+
+		return output, error_output, fmt.Errorf("command %s timed out after %v", command, CommandTimeout)
+	}
 }
 
 // CreateVolume creates the lvm volume

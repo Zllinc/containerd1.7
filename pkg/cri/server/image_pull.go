@@ -160,14 +160,6 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 
 	labels := c.getLabels(ctx, ref)
 
-	// if snapshotter is devbox, add the pinned image label
-	if snapshotter == "devbox" {
-		if labels == nil {
-			labels = map[string]string{}
-		}
-		labels[crilabels.PinnedImageLabelKey] = crilabels.PinnedImageLabelValue
-	}
-
 	pullOpts := []containerd.RemoteOpt{
 		containerd.WithSchema1Conversion, //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
 		containerd.WithResolver(resolver),
@@ -209,11 +201,28 @@ func (c *criService) PullImage(ctx context.Context, r *runtime.PullImageRequest)
 	imageID := configDesc.Digest.String()
 
 	repoDigest, repoTag := getRepoDigestAndTag(namedRef, image.Target().Digest, isSchema1)
+
+	// Iterate over imageID, repoTag, and repoDigest
 	for _, r := range []string{imageID, repoTag, repoDigest} {
 		if r == "" {
 			continue
 		}
-		if err := c.createImageReference(ctx, r, image.Target(), labels); err != nil {
+
+		// Create a copy of labels for each reference to avoid modifying the original map
+		var imageLabels map[string]string
+		if r == repoTag && snapshotter == DevboxSnapshotter {
+			// Only add pin label for repoTag when snapshotter is devbox
+			imageLabels = make(map[string]string)
+			for k, v := range labels {
+				imageLabels[k] = v
+			}
+			imageLabels[crilabels.PinnedImageLabelKey] = crilabels.PinnedImageLabelValue
+		} else {
+			// For imageID and repoDigest, use labels as-is (no pin label)
+			imageLabels = labels
+		}
+
+		if err := c.createImageReference(ctx, r, image.Target(), imageLabels); err != nil {
 			return nil, fmt.Errorf("failed to create image reference %q: %w", r, err)
 		}
 		// Update image store to reflect the newest state in containerd.

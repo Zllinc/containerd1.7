@@ -17,7 +17,10 @@ limitations under the License.
 package lvm
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -27,16 +30,16 @@ import (
 func TestRunCommandSplitErrorInfo(t *testing.T) {
 	// test1: multiline stderr
 	t.Run("multiline stderr", func(t *testing.T) {
-		_, stderr, err := RunCommandSplit("sh", "-c", "echo 'line1' >&2 && echo 'line2' >&2")
+		_, stderr, err := RunCommandSplit(context.Background(), "sh", "-c", "echo 'line1' >&2 && echo 'line2' >&2")
 
 		fmt.Println("error info:", err.Error())
 		fmt.Println("stderr:", string(stderr))
-		
+
 		// check if stderr contains newline
 		if !strings.Contains(string(stderr), "\n") {
 			t.Error("stderr should contain newline")
 		}
-		
+
 		// check if newline is replaced with " | "
 		if err != nil && !strings.Contains(err.Error(), " | ") {
 			t.Error("newline should be replaced with ' | '")
@@ -45,7 +48,7 @@ func TestRunCommandSplitErrorInfo(t *testing.T) {
 
 	// test2: single line stderr
 	t.Run("single line stderr", func(t *testing.T) {
-		_, stderr, err := RunCommandSplit("sh", "-c", "echo 'single error' >&2")
+		_, stderr, err := RunCommandSplit(context.Background(), "sh", "-c", "echo 'single error' >&2")
 
 		fmt.Println("error info:", err.Error())
 		fmt.Println("stderr:", string(stderr))
@@ -57,7 +60,7 @@ func TestRunCommandSplitTimeout(t *testing.T) {
 	// Test 1: Command that completes quickly (should not timeout)
 	t.Run("command completes quickly", func(t *testing.T) {
 		start := time.Now()
-		stdout, stderr, err := RunCommandSplit("echo", "hello")
+		stdout, stderr, err := RunCommandSplit(context.Background(), "echo", "hello")
 		duration := time.Since(start)
 
 		if err != nil {
@@ -88,7 +91,7 @@ func TestRunCommandSplitTimeout(t *testing.T) {
 		sleepSeconds := int(sleepDuration.Seconds())
 
 		start := time.Now()
-		_, _, err := RunCommandSplit("sleep", fmt.Sprintf("%d", sleepSeconds))
+		_, _, err := RunCommandSplit(context.Background(), "sleep", fmt.Sprintf("%d", sleepSeconds))
 		duration := time.Since(start)
 
 		// Should timeout around CommandTimeout (2 minutes)
@@ -106,8 +109,18 @@ func TestRunCommandSplitTimeout(t *testing.T) {
 			t.Error("expected timeout error, got nil")
 		}
 
-		if !strings.Contains(err.Error(), "timed out") {
-			t.Errorf("expected timeout error message, got: %v", err)
+		// When command times out, it's terminated by signal (SIGTERM)
+		// So the error will be "signal: terminated" instead of "timed out"
+		// Check if it's an exec.ExitError (which indicates process was terminated)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Errorf("expected exec.ExitError (process terminated), got: %T: %v", err, err)
+		}
+
+		// Error message should indicate process was terminated by signal
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "terminated") && !strings.Contains(errMsg, "signal") {
+			t.Errorf("expected signal termination error, got: %v", err)
 		}
 
 		t.Logf("✓ Command timed out after %v (expected ~%v)", duration, CommandTimeout)
@@ -127,10 +140,10 @@ wait $CHILD_PID
 `
 
 		start := time.Now()
-		stdout, stderr, err := RunCommandSplit("bash", "-c", script)
+		stdout, stderr, err := RunCommandSplit(context.Background(), "bash", "-c", script)
 		duration := time.Since(start)
-		_ = stdout 
-		_ = stderr 
+		_ = stdout
+		_ = stderr
 
 		// Should timeout
 		if duration < CommandTimeout {
@@ -146,8 +159,18 @@ wait $CHILD_PID
 			t.Error("expected timeout error, got nil")
 		}
 
-		if !strings.Contains(err.Error(), "timed out") {
-			t.Errorf("expected timeout error message, got: %v", err)
+		// When command times out, it's terminated by signal (SIGTERM)
+		// So the error will be "signal: terminated" instead of "timed out"
+		// Check if it's an exec.ExitError (which indicates process was terminated)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Errorf("expected exec.ExitError (process terminated), got: %T: %v", err, err)
+		}
+
+		// Error message should indicate process was terminated by signal
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "terminated") && !strings.Contains(errMsg, "signal") {
+			t.Errorf("expected signal termination error, got: %v", err)
 		}
 
 		t.Logf("✓ Command with children timed out after %v", duration)
@@ -167,7 +190,7 @@ func TestRunCommandSplitTimeoutShortTimeout(t *testing.T) {
 		// But we can't easily test with shorter timeout without modifying the function
 		// So we'll just verify the function works with normal timeout
 		start := time.Now()
-		_, _, err := RunCommandSplit("sleep", "1")
+		_, _, err := RunCommandSplit(context.Background(), "sleep", "1")
 		duration := time.Since(start)
 
 		if err != nil {

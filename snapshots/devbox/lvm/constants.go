@@ -70,4 +70,7 @@ const (
 )
 
 // CommandTimeout is the unified timeout for all LVM commands
-const CommandTimeout = 2 * time.Minute
+const (
+	CommandTimeout      = 2 * time.Minute
+	CommandGraceTimeout = 2 * time.Second
+)

@@ -90,6 +90,9 @@ const (
 
 	// runtimeRunhcsV1 is the runtime type for runhcs.
 	runtimeRunhcsV1 = "io.containerd.runhcs.v1"
+
+	// DevboxSnapshotter is the name of the devbox snapshotter.
+	DevboxSnapshotter = "devbox"
 )
 
 // makeSandboxName generates sandbox name from sandbox metadata. The name

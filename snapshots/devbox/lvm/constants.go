@@ -16,6 +16,8 @@ limitations under the License.
 
 package lvm
 
+import "time"
+
 // lvm vg, lv & pv fields related constants
 const (
 	VGName              = "vg_name"
@@ -65,4 +67,10 @@ const (
 	PVMetadataSize     = "pv_mda_size"
 	PVMetadataFreeSize = "pv_mda_free"
 	PVDeviceSize       = "dev_size"
+)
+
+// CommandTimeout is the unified timeout for all LVM commands
+const (
+	CommandTimeout      = 2 * time.Minute
+	CommandGraceTimeout = 2 * time.Second
 )

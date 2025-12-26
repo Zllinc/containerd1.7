@@ -291,10 +291,7 @@ func RunCommandSplit(ctx context.Context, command string, args ...string) ([]byt
 		klog.Warningf("lvm: command %s %v timed out, sending SIGTERM", command, args)
 
 		if cmd.Process != nil {
-			pgid, err := syscall.Getpgid(cmd.Process.Pid)
-			if err != nil {
-				return cmd.Process.Signal(syscall.SIGTERM)
-			}
+			pgid := cmd.Process.Pid  // pgid should equal to the pid of the process
 			return syscall.Kill(-pgid, syscall.SIGTERM)
 		}
 		return nil
@@ -309,6 +306,15 @@ func RunCommandSplit(ctx context.Context, command string, args ...string) ([]byt
 
 	if len(errorOutput) > 0 {
 		klog.Warningf("lvm: said into stderr: %s", errorOutput)
+	}
+
+	// if the command timed out, send SIGKILL to the process group
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if cmd.Process != nil {
+			pgid := cmd.Process.Pid
+			// ignore error, because the process may have already exited
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}
 	}
 
 	return output, errorOutput, err

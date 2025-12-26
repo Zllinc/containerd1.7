@@ -407,7 +407,7 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 				o.RemoveDir(ctx, dir)
 			}
 			for _, lvName := range removedLvNames {
-				err := o.removeLv(lvName)
+				err := o.removeLv(ctx, lvName)
 				if err != nil {
 					log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume")
 					continue
@@ -482,7 +482,7 @@ func (o *Snapshotter) Cleanup(ctx context.Context) error {
 	}
 
 	for _, lvName := range cleanupLv {
-		err := o.removeLv(lvName)
+		err := o.removeLv(ctx, lvName)
 		if err != nil {
 			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume")
 			continue
@@ -554,7 +554,7 @@ func (o *Snapshotter) getCleanupLvNames(ctx context.Context) ([]string, error) {
 	}
 
 	// lvs := o.vgo.ListLVs()
-	lvs, err := lvm.ListLVMLogicalVolumeByVG(o.lvmVgName, o.ThinPoolName)
+	lvs, err := lvm.ListLVMLogicalVolumeByVG(ctx, o.lvmVgName, o.ThinPoolName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list LVM logical volumes: %w", err)
 	}
@@ -574,7 +574,7 @@ func (o *Snapshotter) getCleanupLvNames(ctx context.Context) ([]string, error) {
 	return cleanup, nil
 }
 
-func (o *Snapshotter) resizeLVMVolume(lvName, useLimit string) error {
+func (o *Snapshotter) resizeLVMVolume(ctx context.Context, lvName, useLimit string) error {
 
 	capacity, err := parseUseLimit(useLimit)
 	if err != nil {
@@ -592,17 +592,17 @@ func (o *Snapshotter) resizeLVMVolume(lvName, useLimit string) error {
 		},
 	}
 
-	return lvm.ResizeLVMVolume(vol, true)
+	return lvm.ResizeLVMVolume(ctx, vol, true)
 }
 
 func isMountPoint(dir string) (bool, error) {
-	// 读取 /proc/mounts 文件
+	// read /proc/mounts file
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		return false, err
 	}
 
-	// 检查目录是否在挂载列表中
+	// check if the directory is in the mount list
 	mounts := strings.Split(string(data), "\n")
 	for _, mount := range mounts {
 		if len(mount) == 0 {
@@ -738,7 +738,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 				} else if isMounted {
 					log.G(ctx).Infof("Path %s is already mounted, skipping mount", npath)
 				} else {
-					if err = o.resizeLVMVolume(lvName, useLimit); err != nil {
+					if err = o.resizeLVMVolume(ctx, lvName, useLimit); err != nil {
 						return fmt.Errorf("failed to resize LVM logical volume %s: %w", lvName, err)
 					}
 
@@ -912,7 +912,7 @@ func parseUseLimit(useLimit string) (string, error) {
 
 }
 
-func (o *Snapshotter) removeLv(lvName string) error {
+func (o *Snapshotter) removeLv(ctx context.Context, lvName string) error {
 	vol := &apis.LVMVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: lvName,
@@ -921,7 +921,7 @@ func (o *Snapshotter) removeLv(lvName string) error {
 			VolGroup: o.lvmVgName,
 		},
 	}
-	return lvm.DestroyVolume(vol)
+	return lvm.DestroyVolume(ctx, vol)
 }
 
 func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir string, contentKey string, useLimit string) (string, string, error) {
@@ -948,7 +948,7 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 		},
 	}
 	log.G(ctx).Debug("Creating LVM volume:", lvName, "with capacity:", capacity, "in volume group:", o.lvmVgName)
-	err = lvm.CreateVolume(vol)
+	err = lvm.CreateVolume(ctx, vol)
 	if err != nil {
 		return td, lvName, fmt.Errorf("failed to create LVM logical volume %s: %w", lvName, err)
 	}
@@ -956,7 +956,7 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 	err = o.mkfs(lvName)
 	if err != nil {
 		// If mkfs fails, we should remove the LVM logical volume
-		if err1 := o.removeLv(lvName); err1 != nil {
+		if err1 := o.removeLv(ctx, lvName); err1 != nil {
 			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume after mkfs failure")
 		}
 		return td, lvName, fmt.Errorf("failed to create filesystem on LVM logical volume %s: %w", lvName, err)
@@ -964,7 +964,7 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 	err = o.mountLvm(ctx, lvName, td)
 	if err != nil {
 		// If mount fails, we should remove the LVM logical volume
-		if err1 := o.removeLv(lvName); err1 != nil {
+		if err1 := o.removeLv(ctx, lvName); err1 != nil {
 			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume after mount failure")
 		}
 		return td, lvName, fmt.Errorf("failed to mount LVM logical volume %s: %w", lvName, err)

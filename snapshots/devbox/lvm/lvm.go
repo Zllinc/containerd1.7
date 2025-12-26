@@ -215,7 +215,7 @@ func NewExecError(output []byte, err error) error {
 }
 
 // builldLVMCreateArgs returns lvcreate command for the volume
-func buildLVMCreateArgs(vol *apis.LVMVolume) []string {
+func buildLVMCreateArgs(ctx context.Context, vol *apis.LVMVolume) []string {
 	var LVMVolArg []string
 
 	volume := vol.Name
@@ -228,9 +228,9 @@ func buildLVMCreateArgs(vol *apis.LVMVolume) []string {
 		// check if thin pool exists for given volumegroup requested thin volume
 		if strings.TrimSpace(vol.Spec.ThinProvision) == "" {
 			LVMVolArg = append(LVMVolArg, "-L", size)
-		} else if !lvThinExists(vol.Spec.VolGroup, pool) {
+		} else if !lvThinExists(ctx, vol.Spec.VolGroup, pool) {
 			// thinpool size can't be equal or greater than actual volumegroup size
-			LVMVolArg = append(LVMVolArg, "-L", getThinPoolSize(vol.Spec.VolGroup, vol.Spec.Capacity))
+			LVMVolArg = append(LVMVolArg, "-L", getThinPoolSize(ctx, vol.Spec.VolGroup, vol.Spec.Capacity))
 		}
 	}
 
@@ -291,7 +291,7 @@ func RunCommandSplit(ctx context.Context, command string, args ...string) ([]byt
 		klog.Warningf("lvm: command %s %v timed out, sending SIGTERM", command, args)
 
 		if cmd.Process != nil {
-			pgid := cmd.Process.Pid  // pgid should equal to the pid of the process
+			pgid := cmd.Process.Pid // pgid should equal to the pid of the process
 			return syscall.Kill(-pgid, syscall.SIGTERM)
 		}
 		return nil
@@ -321,24 +321,24 @@ func RunCommandSplit(ctx context.Context, command string, args ...string) ([]byt
 }
 
 // CreateVolume creates the lvm volume
-func CreateVolume(vol *apis.LVMVolume) error {
+func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	volume := vol.Spec.VolGroup + "/" + vol.Name
 
-	volExists, err := CheckVolumeExists(vol)
+	volExists, err := CheckVolumeExists(ctx, vol)
 	if err != nil {
 		return err
 	}
 	if volExists {
 		klog.Infof("lvm: volume (%s) already exists, skipping its creation", volume)
-		err := ResizeLVMVolume(vol, false)
+		err := ResizeLVMVolume(ctx, vol, false)
 		if err != nil {
 			return err
 		}
 		return nil
 	}
 
-	args := buildLVMCreateArgs(vol)
-	out, _, err := RunCommandSplit(context.Background(), LVCreate, args...)
+	args := buildLVMCreateArgs(ctx, vol)
+	out, _, err := RunCommandSplit(ctx, LVCreate, args...)
 
 	if err != nil {
 		err = NewExecError(out, err)
@@ -353,7 +353,7 @@ func CreateVolume(vol *apis.LVMVolume) error {
 }
 
 // DestroyVolume deletes the lvm volume
-func DestroyVolume(vol *apis.LVMVolume) error {
+func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	if vol.Spec.VolGroup == "" {
 		klog.Infof("volGroup not set for lvm volume %v, skipping its deletion", vol.Name)
 		return nil
@@ -361,7 +361,7 @@ func DestroyVolume(vol *apis.LVMVolume) error {
 
 	volume := vol.Spec.VolGroup + "/" + vol.Name
 
-	volExists, err := CheckVolumeExists(vol)
+	volExists, err := CheckVolumeExists(ctx, vol)
 	if err != nil {
 		return err
 	}
@@ -376,7 +376,7 @@ func DestroyVolume(vol *apis.LVMVolume) error {
 	}
 
 	args := buildLVMDestroyArgs(vol)
-	out, _, err := RunCommandSplit(context.Background(), LVRemove, args...)
+	out, _, err := RunCommandSplit(ctx, LVRemove, args...)
 
 	if err != nil {
 		klog.Errorf(
@@ -391,7 +391,7 @@ func DestroyVolume(vol *apis.LVMVolume) error {
 }
 
 // CheckVolumeExists validates if lvm volume exists
-func CheckVolumeExists(vol *apis.LVMVolume) (bool, error) {
+func CheckVolumeExists(ctx context.Context, vol *apis.LVMVolume) (bool, error) {
 	devPath, err := GetVolumeDevPath(vol)
 	if err != nil {
 		return false, err
@@ -440,7 +440,7 @@ func buildVolumeResizeArgs(vol *apis.LVMVolume, resizefs bool) []string {
 //     same size will not return any errors
 //  2. Triggering `lvextend <dev_path> -L <size>` more than one time will
 //     cause errors
-func ResizeLVMVolume(vol *apis.LVMVolume, resizefs bool) error {
+func ResizeLVMVolume(ctx context.Context, vol *apis.LVMVolume, resizefs bool) error {
 
 	// In case if resizefs is not enabled then check current size
 	// before exapnding LVM volume(If volume is already expanded then
@@ -452,7 +452,7 @@ func ResizeLVMVolume(vol *apis.LVMVolume, resizefs bool) error {
 		return err
 	}
 
-	curVolSize, err := getLVSize(vol)
+	curVolSize, err := getLVSize(ctx, vol)
 	if err != nil {
 		return err
 	}
@@ -467,7 +467,7 @@ func ResizeLVMVolume(vol *apis.LVMVolume, resizefs bool) error {
 	volume := vol.Spec.VolGroup + "/" + vol.Name
 
 	args := buildVolumeResizeArgs(vol, resizefs)
-	out, _, err := RunCommandSplit(context.Background(), LVExtend, args...)
+	out, _, err := RunCommandSplit(ctx, LVExtend, args...)
 
 	if err != nil {
 		klog.Errorf(
@@ -479,7 +479,7 @@ func ResizeLVMVolume(vol *apis.LVMVolume, resizefs bool) error {
 }
 
 // getLVSize will return current LVM volume size in bytes
-func getLVSize(vol *apis.LVMVolume) (uint64, error) {
+func getLVSize(ctx context.Context, vol *apis.LVMVolume) (uint64, error) {
 	lvmVolumeName := vol.Spec.VolGroup + "/" + vol.Name
 
 	args := []string{
@@ -490,7 +490,7 @@ func getLVSize(vol *apis.LVMVolume) (uint64, error) {
 		"--nosuffix",
 	}
 
-	raw, _, err := RunCommandSplit(context.Background(), LVList, args...)
+	raw, _, err := RunCommandSplit(ctx, LVList, args...)
 	if err != nil {
 		return 0, errors.Wrapf(
 			err,
@@ -549,14 +549,14 @@ func buildLVMSnapDestroyArgs(snap *apis.LVMSnapshot) []string {
 }
 
 // CreateSnapshot creates the lvm volume snapshot
-func CreateSnapshot(snap *apis.LVMSnapshot) error {
+func CreateSnapshot(ctx context.Context, snap *apis.LVMSnapshot) error {
 
 	volume := snap.Labels[LVMVolKey]
 
 	snapVolume := snap.Spec.VolGroup + "/" + getLVMSnapName(snap.Name)
 
 	args := buildLVMSnapCreateArgs(snap)
-	out, _, err := RunCommandSplit(context.Background(), LVCreate, args...)
+	out, _, err := RunCommandSplit(ctx, LVCreate, args...)
 
 	if err != nil {
 		klog.Errorf("lvm: could not create snapshot %s cmd %v error: %s", snapVolume, args, string(out))
@@ -569,10 +569,10 @@ func CreateSnapshot(snap *apis.LVMSnapshot) error {
 }
 
 // DestroySnapshot deletes the lvm volume snapshot
-func DestroySnapshot(snap *apis.LVMSnapshot) error {
+func DestroySnapshot(ctx context.Context, snap *apis.LVMSnapshot) error {
 	snapVolume := snap.Spec.VolGroup + "/" + getLVMSnapName(snap.Name)
 
-	ok, err := isSnapshotExists(snap.Spec.VolGroup, getLVMSnapName(snap.Name))
+	ok, err := isSnapshotExists(ctx, snap.Spec.VolGroup, getLVMSnapName(snap.Name))
 	if !ok {
 		klog.Infof("lvm: snapshot %s does not exist, skipping deletion", snapVolume)
 		return nil
@@ -584,7 +584,7 @@ func DestroySnapshot(snap *apis.LVMSnapshot) error {
 	}
 
 	args := buildLVMSnapDestroyArgs(snap)
-	out, _, err := RunCommandSplit(context.Background(), LVRemove, args...)
+	out, _, err := RunCommandSplit(ctx, LVRemove, args...)
 
 	if err != nil {
 		klog.Errorf("lvm: could not remove snapshot %s cmd %v error: %s", snapVolume, args, string(out))
@@ -696,9 +696,9 @@ func getIntFieldValue(fieldName, fieldValue string) int {
 
 // ReloadLVMMetadataCache refreshes lvmetad daemon cache used for
 // serving vgs or other lvm utility.
-func ReloadLVMMetadataCache() error {
+func ReloadLVMMetadataCache(ctx context.Context) error {
 	args := []string{"--cache"}
-	output, _, err := RunCommandSplit(context.Background(), PVScan, args...)
+	output, _, err := RunCommandSplit(ctx, PVScan, args...)
 	if err != nil {
 		klog.Errorf("lvm: reload lvm metadata cache: %v - %v", string(output), err)
 		return err
@@ -711,9 +711,9 @@ func ReloadLVMMetadataCache() error {
 // groups in the node.
 //
 // In case reloadCache is false, we skip refreshing lvm metadata cache.
-func ListLVMVolumeGroup(reloadCache bool) ([]apis.VolumeGroup, error) {
+func ListLVMVolumeGroup(ctx context.Context, reloadCache bool) ([]apis.VolumeGroup, error) {
 	if reloadCache {
-		if err := ReloadLVMMetadataCache(); err != nil {
+		if err := ReloadLVMMetadataCache(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -723,7 +723,7 @@ func ListLVMVolumeGroup(reloadCache bool) ([]apis.VolumeGroup, error) {
 		"--reportformat", "json",
 		"--units", "b",
 	}
-	output, _, err := RunCommandSplit(context.Background(), VGList, args...)
+	output, _, err := RunCommandSplit(ctx, VGList, args...)
 	if err != nil {
 		klog.Errorf("lvm: list volume group cmd %v: %v", args, err)
 		return nil, err
@@ -912,13 +912,13 @@ func decodeLvsJSON(raw []byte) ([]LogicalVolume, error) {
 	return lvs, nil
 }
 
-func ListLVMLogicalVolume() ([]LogicalVolume, error) {
+func ListLVMLogicalVolume(ctx context.Context) ([]LogicalVolume, error) {
 	args := []string{
 		"--options", "lv_all,vg_name,segtype",
 		"--reportformat", "json",
 		"--units", "b",
 	}
-	output, _, err := RunCommandSplit(context.Background(), LVList, args...)
+	output, _, err := RunCommandSplit(ctx, LVList, args...)
 	if err != nil {
 		klog.Errorf("lvm: error while running command %s %v: %v", LVList, args, err)
 		return nil, err
@@ -928,8 +928,8 @@ func ListLVMLogicalVolume() ([]LogicalVolume, error) {
 }
 
 // modified by sealos
-func ListLVMLogicalVolumeByVG(vg string, pool string) ([]LogicalVolume, error) {
-	if err := ReloadLVMMetadataCache(); err != nil {
+func ListLVMLogicalVolumeByVG(ctx context.Context, vg string, pool string) ([]LogicalVolume, error) {
+	if err := ReloadLVMMetadataCache(ctx); err != nil {
 		return nil, err
 	}
 
@@ -942,7 +942,7 @@ func ListLVMLogicalVolumeByVG(vg string, pool string) ([]LogicalVolume, error) {
 	if pool != "" {
 		args = append(args, "--select", fmt.Sprintf("pool_lv=%s", pool))
 	}
-	output, _, err := RunCommandSplit(context.Background(), LVList, args...)
+	output, _, err := RunCommandSplit(ctx, LVList, args...)
 	if err != nil {
 		klog.Errorf("lvm: error while running command %s %v: %v", LVList, args, err)
 		return nil, err
@@ -956,8 +956,8 @@ func ListLVMLogicalVolumeByVG(vg string, pool string) ([]LogicalVolume, error) {
 /*
 ListLVMPhysicalVolume invokes `pvs` to list all the available LVM physical volumes in the node.
 */
-func ListLVMPhysicalVolume() ([]PhysicalVolume, error) {
-	if err := ReloadLVMMetadataCache(); err != nil {
+func ListLVMPhysicalVolume(ctx context.Context) ([]PhysicalVolume, error) {
+	if err := ReloadLVMMetadataCache(ctx); err != nil {
 		return nil, err
 	}
 
@@ -966,7 +966,7 @@ func ListLVMPhysicalVolume() ([]PhysicalVolume, error) {
 		"--reportformat", "json",
 		"--units", "b",
 	}
-	output, _, err := RunCommandSplit(context.Background(), PVList, args...)
+	output, _, err := RunCommandSplit(ctx, PVList, args...)
 	if err != nil {
 		klog.Errorf("lvm: error while running command %s %v: %v", PVList, args, err)
 		return nil, err
@@ -1092,8 +1092,8 @@ func decodePvsJSON(raw []byte) ([]PhysicalVolume, error) {
 }
 
 // lvThinExists verifies if thin pool/volume already exists for given volumegroup
-func lvThinExists(vg string, name string) bool {
-	out, _, err := RunCommandSplit(context.Background(), "lvs", vg+"/"+name, "--noheadings", "-o", "lv_name")
+func lvThinExists(ctx context.Context, vg string, name string) bool {
+	out, _, err := RunCommandSplit(ctx, "lvs", vg+"/"+name, "--noheadings", "-o", "lv_name")
 	if err != nil {
 		klog.Errorf("failed to list existing volumes:%v", err)
 		return false
@@ -1104,8 +1104,8 @@ func lvThinExists(vg string, name string) bool {
 
 // snapshotExists checks if a snapshot volume exists for the given volumegroup
 // and snapshot name.
-func isSnapshotExists(vg, snapVolumeName string) (bool, error) {
-	out, _, err := RunCommandSplit(context.Background(), "lvs", vg+"/"+snapVolumeName, "--noheadings", "-o", "lv_name")
+func isSnapshotExists(ctx context.Context, vg, snapVolumeName string) (bool, error) {
+	out, _, err := RunCommandSplit(ctx, "lvs", vg+"/"+snapVolumeName, "--noheadings", "-o", "lv_name")
 	if err != nil {
 		return false, err
 	}
@@ -1113,8 +1113,8 @@ func isSnapshotExists(vg, snapVolumeName string) (bool, error) {
 }
 
 // getVGSize get the size in bytes for given volumegroup name
-func getVGSize(vgname string) string {
-	out, _, err := RunCommandSplit(context.Background(), "vgs", vgname, "--noheadings", "-o", "vg_free", "--units", "b", "--nosuffix")
+func getVGSize(ctx context.Context, vgname string) string {
+	out, _, err := RunCommandSplit(ctx, "vgs", vgname, "--noheadings", "-o", "vg_free", "--units", "b", "--nosuffix")
 	if err != nil {
 		klog.Errorf("failed to list existing volumegroup:%v , %v", vgname, err)
 		return ""
@@ -1124,8 +1124,8 @@ func getVGSize(vgname string) string {
 
 // getThinPoolSize gets size for a given volumegroup, compares it with
 // the requested volume size and returns the minimum size as a thin pool size
-func getThinPoolSize(vgname, volsize string) string {
-	outStr := getVGSize(vgname)
+func getThinPoolSize(ctx context.Context, vgname, volsize string) string {
+	outStr := getVGSize(ctx, vgname)
 	vgFreeSize, err := strconv.ParseInt(strings.TrimSpace(string(outStr)), 10, 64)
 	if err != nil {
 		klog.Errorf("failed to convert vg_size to int, got size,:%v , %v", outStr, err)

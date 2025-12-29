@@ -345,7 +345,14 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 		klog.Errorf(
 			"lvm: could not create volume %v cmd %v error: %s", volume, args, string(out),
 		)
-		return err
+		// remove lvm volume if creation failed
+		if cleanupErr := DestroyVolume(ctx, vol); cleanupErr != nil {
+			klog.Warningf("lvm: failed to cleanup volume %s: %v", volume, cleanupErr)
+		} else {
+			klog.Infof("lvm: successfully cleaned up failed volume %s", volume)
+		}
+
+		return NewExecError(out, err)
 	}
 	klog.Infof("lvm: created volume %s", volume)
 
@@ -899,12 +906,13 @@ func decodeLvsJSON(raw []byte) ([]LogicalVolume, error) {
 	for _, item := range items {
 		var lv LogicalVolume
 		if lv, err = parseLogicalVolume(item); err != nil {
-			return lvs, err
+			klog.Warningf("failed to parse LV, skipping: %v", err)
+			continue
 		}
 		deviceName, err := getLvDeviceName(lv.Path)
 		if err != nil {
-			klog.Error(err)
-			return nil, err
+			klog.Warningf("failed to get device name for LV %s, skipping: %v", lv.Name, err)
+			continue
 		}
 		lv.Device = deviceName
 		lvs = append(lvs, lv)

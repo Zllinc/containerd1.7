@@ -909,7 +909,8 @@ func decodeLvsJSON(raw []byte) ([]LogicalVolume, error) {
 	for _, item := range items {
 		var lv LogicalVolume
 		if lv, err = parseLogicalVolume(item); err != nil {
-			return lvs, err
+			klog.Warningf("failed to parse LV %s, skipping: %v", lv.Name, err)
+			continue
 		}
 		deviceName, err := getLvDeviceName(lv.Path)
 		if err != nil {

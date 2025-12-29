@@ -345,6 +345,13 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 		klog.Errorf(
 			"lvm: could not create volume %v cmd %v error: %s", volume, args, string(out),
 		)
+		// remove lvm volume if creation failed
+		if cleanupErr := DestroyVolume(ctx, vol); cleanupErr != nil {
+			klog.Warningf("lvm: failed to cleanup volume %s: %v", volume, cleanupErr)
+		} else {
+			klog.Infof("lvm: successfully cleaned up failed volume %s", volume)
+		}
+
 		return err
 	}
 	klog.Infof("lvm: created volume %s", volume)
@@ -743,8 +750,11 @@ func getLvDeviceName(path string) (string, error) {
 		klog.Errorf("failed to resolve device mapper from lv path %v: %v", path, err)
 		return "", err
 	}
-	deviceName := strings.Split(dmPath, "/")
-	return deviceName[len(deviceName)-1], nil
+	_, file := filepath.Split(dmPath)
+	if file == "" {
+		return "", fmt.Errorf("invalid device path: %s", dmPath)
+	}
+	return file, nil
 }
 
 // To parse the output of lvs command and store it in LogicalVolume
@@ -899,12 +909,13 @@ func decodeLvsJSON(raw []byte) ([]LogicalVolume, error) {
 	for _, item := range items {
 		var lv LogicalVolume
 		if lv, err = parseLogicalVolume(item); err != nil {
-			return lvs, err
+			klog.Warningf("failed to parse LV %s, skipping: %v", lv.Name, err)
+			continue
 		}
 		deviceName, err := getLvDeviceName(lv.Path)
 		if err != nil {
-			klog.Error(err)
-			return nil, err
+			klog.Warningf("failed to get device name for LV %s, skipping: %v", lv.Name, err)
+			continue
 		}
 		lv.Device = deviceName
 		lvs = append(lvs, lv)

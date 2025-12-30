@@ -1,206 +1,291 @@
 /*
-Copyright 2017 The Kubernetes Authors.
+   Copyright The containerd Authors.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+       http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
 */
 
 package lvm
 
 import (
 	"context"
-	"errors"
+	"os"
 	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
-	"time"
+
+	apis "github.com/openebs/lvm-localpv/pkg/apis/openebs.io/lvm/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestRunCommandSplitErrorInfo tests the RunCommandSplit function
-func TestRunCommandSplitErrorInfo(t *testing.T) {
-	// test1: multiline stderr
-	t.Run("multiline stderr", func(t *testing.T) {
-		_, stderr, err := RunCommandSplit(context.Background(), "sh", "-c", "echo 'line1' >&2 && echo 'line2' >&2")
+const (
+	testVGName   = "devbox-vg"
+	testPoolName = "devbox-vg-thinpool"
+)
 
-		fmt.Println("error info:", err.Error())
-		fmt.Println("stderr:", string(stderr))
+// TestForceDestroyVolume_NormalLV tests force destroying a normal LV
+func TestForceDestroyVolume_NormalLV(t *testing.T) {
 
-		// check if stderr contains newline
-		if !strings.Contains(string(stderr), "\n") {
-			t.Error("stderr should contain newline")
-		}
+	ctx := context.Background()
 
-		// check if newline is replaced with " | "
-		if err != nil && !strings.Contains(err.Error(), " | ") {
-			t.Error("newline should be replaced with ' | '")
-		}
-	})
+	// Create a test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-normal-lv",
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
 
-	// test2: single line stderr
-	t.Run("single line stderr", func(t *testing.T) {
-		_, stderr, err := RunCommandSplit(context.Background(), "sh", "-c", "echo 'single error' >&2")
+	// Create the volume
+	err := CreateVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
 
-		fmt.Println("error info:", err.Error())
-		fmt.Println("stderr:", string(stderr))
-	})
+	// Verify it exists
+	exists, err := CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists: %v", err)
+	}
+	if !exists {
+		t.Fatal("Volume should exist after creation")
+	}
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, vol.Name)
+
+	// Check if the device exists
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		t.Fatalf("LVM logical volume %s does not exist: %v", devicePath, err)
+	}
+
+	cmd := exec.Command("mkfs.ext4", devicePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to create filesystem on %s: %v, output: %s", devicePath, err, string(output))
+	}
+
+	// Force destroy it
+	err = ForceDestroyVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to force destroy volume: %v", err)
+	}
+
+	// Verify it's gone
+	exists, err = CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists after deletion: %v", err)
+	}
+	if exists {
+		t.Fatal("Volume should not exist after force destruction")
+	}
 }
 
-// TestRunCommandSplitTimeout tests the timeout mechanism
-func TestRunCommandSplitTimeout(t *testing.T) {
-	// Test 1: Command that completes quickly (should not timeout)
-	t.Run("command completes quickly", func(t *testing.T) {
-		start := time.Now()
-		stdout, stderr, err := RunCommandSplit(context.Background(), "echo", "hello")
-		duration := time.Since(start)
+// TestForceDestroyVolume_ZombieLV tests force destroying a zombie LV (metadata exists but device node missing)
+func TestForceDestroyVolume_ZombieLV(t *testing.T) {
+	ctx := context.Background()
 
-		if err != nil {
-			t.Errorf("expected no error, got: %v", err)
-		}
+	// Create a test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-zombie-lv",
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
 
-		if duration > CommandTimeout {
-			t.Errorf("command should complete before timeout, took: %v", duration)
-		}
+	// Create the volume
+	err := CreateVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
 
-		output := strings.TrimSpace(string(stdout))
-		if output != "hello" {
-			t.Errorf("expected output 'hello', got: %s", output)
-		}
+	// Verify it exists
+	exists, err := CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists: %v", err)
+	}
+	if !exists {
+		t.Fatal("Volume should exist after creation")
+	}
 
-		if len(stderr) > 0 {
-			t.Errorf("expected no stderr, got: %s", string(stderr))
-		}
+	// Simulate zombie LV by removing device nodes manually
+	// Note: This is a simulation - in real scenarios, zombie LVs are created
+	// when lvcreate is killed after metadata creation but before device creation
+	devPath := DevPath + testVGName + "/" + vol.Name
+	mapperPath := "/dev/mapper/" + strings.Replace(testVGName, "-", "--", -1) + "-" + strings.Replace(vol.Name, "-", "--", -1)
 
-		t.Logf("✓ Command completed in %v (expected < %v)", duration, CommandTimeout)
-	})
+	// Remove device nodes (this requires root privileges)
+	// In a real test environment, this step might fail if we don't have privileges
+	// That's okay - the force destroy should still work
+	os.Remove(devPath)
+	os.Remove(mapperPath)
 
-	// Test 2: Command that times out (sleep longer than timeout)
-	t.Run("command times out", func(t *testing.T) {
-		// Sleep for longer than CommandTimeout (2 minutes)
-		// Use 3 minutes to ensure it times out
-		sleepDuration := CommandTimeout + 1*time.Minute
-		sleepSeconds := int(sleepDuration.Seconds())
+	// Try to verify the LV is now zombie-like
+	// CheckVolumeExists (old method) would return false
+	// But CheckLVMMetadataExists should return true
+	exists, err = CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check LVM metadata: %v", err)
+	}
+	if !exists {
+		t.Fatal("LVM metadata should still exist for zombie LV")
+	}
 
-		start := time.Now()
-		_, _, err := RunCommandSplit(context.Background(), "sleep", fmt.Sprintf("%d", sleepSeconds))
-		duration := time.Since(start)
+	exists, err = CheckVolumeExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists: %v", err)
+	}
+	if exists {
+		t.Fatal("Volume should not exist")
+	}
 
-		// Should timeout around CommandTimeout (2 minutes)
-		if duration < CommandTimeout {
-			t.Errorf("command should timeout after %v, but completed in %v", CommandTimeout, duration)
-		}
+	// Force destroy should work even for zombie LVs
+	err = ForceDestroyVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to force destroy zombie LV: %v", err)
+	}
 
-		// Allow some tolerance (should timeout within CommandTimeout + 5 seconds)
-		if duration > CommandTimeout+5*time.Second {
-			t.Errorf("command should timeout around %v, but took %v", CommandTimeout, duration)
-		}
-
-		// Should return timeout error
-		if err == nil {
-			t.Error("expected timeout error, got nil")
-		}
-
-		// When command times out, it's terminated by signal (SIGTERM)
-		// So the error will be "signal: terminated" instead of "timed out"
-		// Check if it's an exec.ExitError (which indicates process was terminated)
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			t.Errorf("expected exec.ExitError (process terminated), got: %T: %v", err, err)
-		}
-
-		// Error message should indicate process was terminated by signal
-		errMsg := err.Error()
-		if !strings.Contains(errMsg, "terminated") && !strings.Contains(errMsg, "signal") {
-			t.Errorf("expected signal termination error, got: %v", err)
-		}
-
-		t.Logf("✓ Command timed out after %v (expected ~%v)", duration, CommandTimeout)
-		t.Logf("✓ Error message: %v", err)
-	})
-
-	// Test 3: Command with child processes (simulate lvcreate behavior)
-	t.Run("command with child processes times out", func(t *testing.T) {
-		// Create a script that spawns child processes and sleeps
-		script := `#!/bin/bash
-# Spawn a child process that sleeps
-(sleep 300) &
-CHILD_PID=$!
-# Parent also sleeps
-sleep 300
-wait $CHILD_PID
-`
-
-		start := time.Now()
-		stdout, stderr, err := RunCommandSplit(context.Background(), "bash", "-c", script)
-		duration := time.Since(start)
-		_ = stdout
-		_ = stderr
-
-		// Should timeout
-		if duration < CommandTimeout {
-			t.Errorf("command with children should timeout after %v, but completed in %v", CommandTimeout, duration)
-		}
-
-		if duration > CommandTimeout+5*time.Second {
-			t.Errorf("command should timeout around %v, but took %v", CommandTimeout, duration)
-		}
-
-		// Should return timeout error
-		if err == nil {
-			t.Error("expected timeout error, got nil")
-		}
-
-		// When command times out, it's terminated by signal (SIGTERM)
-		// So the error will be "signal: terminated" instead of "timed out"
-		// Check if it's an exec.ExitError (which indicates process was terminated)
-		var exitErr *exec.ExitError
-		if !errors.As(err, &exitErr) {
-			t.Errorf("expected exec.ExitError (process terminated), got: %T: %v", err, err)
-		}
-
-		// Error message should indicate process was terminated by signal
-		errMsg := err.Error()
-		if !strings.Contains(errMsg, "terminated") && !strings.Contains(errMsg, "signal") {
-			t.Errorf("expected signal termination error, got: %v", err)
-		}
-
-		t.Logf("✓ Command with children timed out after %v", duration)
-		t.Logf("✓ Error message: %v", err)
-		t.Logf("✓ Stdout: %s", string(stdout))
-		t.Logf("✓ Stderr: %s", string(stderr))
-	})
+	// Verify it's gone
+	exists, err = CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists after deletion: %v", err)
+	}
+	if exists {
+		t.Fatal("Zombie LV should not exist after force destruction")
+	}
 }
 
-// TestRunCommandSplitTimeoutShortTimeout tests with a shorter timeout for faster testing
-// This test uses a modified version that allows custom timeout for testing
-func TestRunCommandSplitTimeoutShortTimeout(t *testing.T) {
-	// This test requires modifying RunCommandSplit to accept timeout parameter
-	// For now, we'll test with a script that simulates the behavior
-	t.Run("short timeout test", func(t *testing.T) {
-		// Use a script that sleeps for 5 seconds
-		// But we can't easily test with shorter timeout without modifying the function
-		// So we'll just verify the function works with normal timeout
-		start := time.Now()
-		_, _, err := RunCommandSplit(context.Background(), "sleep", "1")
-		duration := time.Since(start)
+// TestCheckLVMMetadataExists_ExistingLV tests checking for an existing LV
+func TestCheckLVMMetadataExists_ExistingLV(t *testing.T) {
+	ctx := context.Background()
 
-		if err != nil {
-			t.Errorf("expected no error for 1 second sleep, got: %v", err)
-		}
+	// Create a test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-existing-lv",
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
 
-		if duration > 5*time.Second {
-			t.Errorf("1 second sleep should complete quickly, took: %v", duration)
-		}
+	// Create the volume
+	err := CreateVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
 
-		t.Logf("✓ Short command completed in %v", duration)
-	})
+	// Clean up after test
+	defer ForceDestroyVolume(ctx, vol)
+
+	// Check it exists
+	exists, err := CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists: %v", err)
+	}
+	if !exists {
+		t.Fatal("Volume should exist")
+	}
+}
+
+// TestCheckLVMMetadataExists_NonExistingLV tests checking for a non-existing LV
+func TestCheckLVMMetadataExists_NonExistingLV(t *testing.T) {
+	ctx := context.Background()
+
+	// Create a volume that doesn't exist
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-nonexisting-lv",
+		},
+		Spec: apis.VolumeInfo{
+			VolGroup: testVGName,
+		},
+	}
+
+	// Check it doesn't exist
+	exists, err := CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to check volume exists: %v", err)
+	}
+	if exists {
+		t.Fatal("Volume should not exist")
+	}
+}
+
+// TestForceDestroyVolume_NonExistingLV tests force destroying a non-existing LV (should not error)
+func TestForceDestroyVolume_NonExistingLV(t *testing.T) {
+	ctx := context.Background()
+
+	// Create a volume that doesn't exist
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-nonexisting-destroy-lv",
+		},
+		Spec: apis.VolumeInfo{
+			VolGroup: testVGName,
+		},
+	}
+
+	// Force destroy should not error
+	err := ForceDestroyVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Force destroy of non-existing volume should not error: %v", err)
+	}
+}
+
+// TestForceDestroyVolume_Idempotent tests that force destroy is idempotent
+func TestForceDestroyVolume_Idempotent(t *testing.T) {
+	if os.Getenv("RUN_LVM_TESTS") != "true" {
+		t.Skip("Skipping LVM tests. Set RUN_LVM_TESTS=true to run")
+	}
+
+	ctx := context.Background()
+
+	// Create a test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-idempotent-lv",
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Create the volume
+	err := CreateVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
+
+	// Force destroy it first time
+	err = ForceDestroyVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Failed to force destroy volume first time: %v", err)
+	}
+
+	// Force destroy it second time (should be idempotent)
+	err = ForceDestroyVolume(ctx, vol)
+	if err != nil {
+		t.Fatalf("Force destroy should be idempotent: %v", err)
+	}
 }

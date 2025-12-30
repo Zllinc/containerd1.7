@@ -329,7 +329,7 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 		return err
 	}
 	if volExists {
-		klog.Infof("lvm: volume (%s) already exists, skipping its creation", volume)
+		klog.Infof("CreateVolume: volume (%s) already exists, skipping its creation", volume)
 		err := ResizeLVMVolume(ctx, vol, false)
 		if err != nil {
 			return err
@@ -343,18 +343,11 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	if err != nil {
 		err = NewExecError(out, err)
 		klog.Errorf(
-			"lvm: could not create volume %v cmd %v error: %s", volume, args, string(out),
+			"CreateVolume: could not create volume %v cmd %v error: %s", volume, args, string(out),
 		)
-		// remove lvm volume if creation failed
-		if cleanupErr := DestroyVolume(ctx, vol); cleanupErr != nil {
-			klog.Warningf("lvm: failed to cleanup volume %s: %v", volume, cleanupErr)
-		} else {
-			klog.Infof("lvm: successfully cleaned up failed volume %s", volume)
-		}
-
 		return err
 	}
-	klog.Infof("lvm: created volume %s", volume)
+	klog.Infof("CreateVolume: created volume %s", volume)
 
 	return nil
 }
@@ -362,7 +355,7 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 // DestroyVolume deletes the lvm volume
 func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	if vol.Spec.VolGroup == "" {
-		klog.Infof("volGroup not set for lvm volume %v, skipping its deletion", vol.Name)
+		klog.Infof("DestroyVolume: volGroup not set for lvm volume %v, skipping its deletion", vol.Name)
 		return nil
 	}
 
@@ -373,7 +366,7 @@ func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 		return err
 	}
 	if !volExists {
-		klog.Infof("lvm: volume (%s) doesn't exists, skipping its deletion", volume)
+		klog.Infof("DestroyVolume: volume (%s) doesn't exists, skipping its deletion", volume)
 		return nil
 	}
 
@@ -387,14 +380,78 @@ func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 
 	if err != nil {
 		klog.Errorf(
-			"lvm: could not destroy volume %v cmd %v error: %s", volume, args, string(out),
+			"DestroyVolume: could not destroy volume %v cmd %v error: %s", volume, args, string(out),
 		)
 		return err
 	}
 
-	klog.Infof("lvm: destroyed volume %s", volume)
+	klog.Infof("DestroyVolume: destroyed volume %s", volume)
 
 	return nil
+}
+
+// ForceDestroyVolume force destroys the lvm volume
+func ForceDestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
+	if vol.Spec.VolGroup == "" {
+		klog.Infof("ForceDestroyVolume: volGroup not set for lvm volume %v, skipping its deletion", vol.Name)
+		return nil
+	}
+
+	volume := vol.Spec.VolGroup + "/" + vol.Name
+
+	// check if the volume exists in metadata
+	exists, _ := CheckLVMMetadataExists(ctx, vol)
+	if !exists {
+		klog.Infof("ForceDestroyVolume: volume (%s) doesn't exist in metadata", volume)
+		return nil
+	}
+
+	// force destroy the volume, ignore file system cleanup
+	args := buildLVMDestroyArgs(vol)
+	args = append(args, "-f")
+	out, _, err := RunCommandSplit(ctx, LVRemove, args...)
+	if err != nil {
+		klog.Errorf("ForceDestroyVolume: could not force destroy volume %v: %s", volume, string(out))
+		return err
+	}
+
+	klog.Infof("ForceDestroyVolume: force destroyed volume %s successfully", volume)
+	return nil
+}
+
+// CheckLVMMetadataExists checks if the lvm volume exists in metadata
+func CheckLVMMetadataExists(ctx context.Context, vol *apis.LVMVolume) (bool, error) {
+	// reload lvm metadata cache to ensure the metadata is up to date
+	if err := ReloadLVMMetadataCache(ctx); err != nil {
+		klog.Warningf("failed to reload LVM metadata cache: %v", err)
+		// continue to check the metadata
+	}
+
+	args := []string{
+		"--noheadings",
+		"-o", "lv_name,vg_name",
+		"--select", fmt.Sprintf("lv_name=%s && vg_name=%s", vol.Name, vol.Spec.VolGroup),
+	}
+
+	out, _, err := RunCommandSplit(ctx, LVList, args...)
+	if err != nil {
+		klog.Errorf("lvm: failed to check LVM metadata exists for volume %s: %v", vol.Name, err)
+		return false, nil
+	}
+
+	output := strings.TrimSpace(string(out))
+	if output == "" {
+		klog.Infof("lvm: volume (%s) doesn't exist in metadata", vol.Name)
+		return false, nil
+	}
+
+	// check if the output contains the correct LV and VG name
+	fields := strings.Fields(output)
+	if len(fields) >= 2 {
+		return fields[0] == vol.Name && fields[1] == vol.Spec.VolGroup, nil
+	}
+
+	return false, nil
 }
 
 // CheckVolumeExists validates if lvm volume exists

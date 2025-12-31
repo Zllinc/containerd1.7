@@ -482,14 +482,16 @@ func (o *Snapshotter) Cleanup(ctx context.Context) error {
 	}
 
 	for _, lvName := range cleanupLv {
-		err := o.removeLv(ctx, lvName)
-		if err != nil {
+		if err := o.unmountLvm(ctx, lvName); err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Cleanup: failed to unmount LVM logical volume before removal")
+			continue
+		}
+		if err := o.removeLv(ctx, lvName); err != nil {
 			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Cleanup: failed to destroy LVM logical volume")
 			continue
 		}
 		log.G(ctx).Infof("Cleanup: LVM logical volume %s removed successfully", lvName)
 	}
-
 	return nil
 }
 

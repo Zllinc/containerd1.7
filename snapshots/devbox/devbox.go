@@ -721,36 +721,16 @@ func (o *Snapshotter) mkfs(lvName string) error {
 }
 
 func (o *Snapshotter) mountLvm(ctx context.Context, lvName string, path string) error {
-	_, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		if err := os.MkdirAll(path, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", path, err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("failed to stat path %s: %w", path, err)
-	}
 	devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
-	err = syscall.Mount(devicePath, path, "ext4", 0, "")
-	if err != nil {
+	if err := lvm.MountVolume(devicePath, path, "ext4", 0, ""); err != nil {
 		return fmt.Errorf("failed to mount LVM logical volume %s to %s: %w", devicePath, path, err)
 	}
 	return nil
 }
 
+// unmountLvm unmounts the LVM logical volume
 func (o *Snapshotter) unmountLvm(ctx context.Context, path string) error {
-	isMounted, err := isMountPoint(path)
-	if err != nil {
-		return fmt.Errorf("failed to check if path %s is a mount point: %w", path, err)
-	}
-	if !isMounted {
-		log.G(ctx).Infof("Path %s is not mounted, skipping unmount", path)
-		return nil
-	}
-	err = syscall.Unmount(path, 0)
-	if err != nil {
-		return fmt.Errorf("failed to unmount path %s: %w", path, err)
-	}
-	return nil
+	return lvm.UnmountVolume(path)
 }
 
 // end modified by sealos

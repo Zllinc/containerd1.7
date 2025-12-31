@@ -436,6 +436,95 @@ func ForceDestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	return nil
 }
 
+// MountVolume mounts an LVM logical volume to the specified path
+// This function is protected by the global LVM lock to prevent concurrent operations
+func MountVolume(devicePath, mountPath, fsType string, flags uintptr, options string) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
+	// check if the mount path exists, if not create it
+	if _, err := os.Stat(mountPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(mountPath, 0755); err != nil {
+			return fmt.Errorf("failed to create mount directory %s: %w", mountPath, err)
+		}
+	} else if err != nil {
+		// handle other errors (e.g., permission denied, IO error, etc.)
+		return fmt.Errorf("failed to stat mount path %s: %w", mountPath, err)
+	}
+
+	// check if the device exists
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		return fmt.Errorf("device %s does not exist: %w", devicePath, err)
+	} else if err != nil {
+		// handle other errors (e.g., permission denied, IO error, etc.)
+		return fmt.Errorf("failed to stat device %s: %w", devicePath, err)
+	}
+
+	// execute mount
+	if err := syscall.Mount(devicePath, mountPath, fsType, flags, options); err != nil {
+		return fmt.Errorf("failed to mount %s to %s: %w", devicePath, mountPath, err)
+	}
+
+	klog.Infof("lvm: successfully mounted %s to %s", devicePath, mountPath)
+	return nil
+}
+
+// UnmountVolume unmounts a path
+// This function is protected by the global LVM lock to prevent concurrent operations
+// It uses the same lock as LVM operations because unmount often happens alongside
+// LVM operations (resize, remove) and they may conflict on the same device
+func UnmountVolume(mountPath string) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
+	// check if the path is a mount point
+	isMounted, err := isMountPoint(mountPath)
+	if err != nil {
+		return fmt.Errorf("failed to check if %s is a mount point: %w", mountPath, err)
+	}
+
+	if !isMounted {
+		klog.Infof("lvm: path %s is not a mount point, skipping unmount", mountPath)
+		return nil
+	}
+
+	// unmount
+	if err := syscall.Unmount(mountPath, 0); err != nil {
+		klog.Warningf("lvm: failed to unmount %s: %v", mountPath, err)
+		return fmt.Errorf("failed to unmount %s: %w", mountPath, err)
+	}
+
+	klog.Infof("lvm: successfully unmounted %s", mountPath)
+	return nil
+}
+
+// isMountPoint checks if a directory is a mount point
+func isMountPoint(dir string) (bool, error) {
+	// check if the directory exists
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return false, nil
+	}
+
+	// get directory information
+	dirStat, err := os.Stat(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat %s: %w", dir, err)
+	}
+
+	// get parent directory information
+	parentDir := filepath.Dir(dir)
+	parentStat, err := os.Stat(parentDir)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat parent %s: %w", parentDir, err)
+	}
+
+	// if the directory and parent directory have different device numbers, it is a mount point
+	dirDev := dirStat.Sys().(*syscall.Stat_t).Dev
+	parentDev := parentStat.Sys().(*syscall.Stat_t).Dev
+
+	return dirDev != parentDev, nil
+}
+
 // CheckLVMMetadataExists checks if the lvm volume exists in metadata
 func CheckLVMMetadataExists(ctx context.Context, vol *apis.LVMVolume) (bool, error) {
 	// reload lvm metadata cache to ensure the metadata is up to date

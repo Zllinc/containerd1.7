@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/pkg/errors"
@@ -34,6 +35,9 @@ import (
 
 	apis "github.com/openebs/lvm-localpv/pkg/apis/openebs.io/lvm/v1alpha1"
 )
+
+// lvmLock lvm global lock
+var lvmLock sync.Mutex
 
 // lvm related constants
 const (
@@ -322,6 +326,9 @@ func RunCommandSplit(ctx context.Context, command string, args ...string) ([]byt
 
 // CreateVolume creates the lvm volume
 func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
 	volume := vol.Spec.VolGroup + "/" + vol.Name
 
 	volExists, err := CheckVolumeExists(ctx, vol)
@@ -330,7 +337,7 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	}
 	if volExists {
 		klog.Infof("CreateVolume: volume (%s) already exists, skipping its creation", volume)
-		err := ResizeLVMVolume(ctx, vol, false)
+		err := resizeLVMVolumeInternal(ctx, vol, false)
 		if err != nil {
 			return err
 		}
@@ -354,6 +361,9 @@ func CreateVolume(ctx context.Context, vol *apis.LVMVolume) error {
 
 // DestroyVolume deletes the lvm volume
 func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
 	if vol.Spec.VolGroup == "" {
 		klog.Infof("DestroyVolume: volGroup not set for lvm volume %v, skipping its deletion", vol.Name)
 		return nil
@@ -392,6 +402,9 @@ func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 
 // ForceDestroyVolume force destroys the lvm volume
 func ForceDestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
 	if vol.Spec.VolGroup == "" {
 		klog.Infof("ForceDestroyVolume: volGroup not set for lvm volume %v, skipping its deletion", vol.Name)
 		return nil
@@ -508,8 +521,16 @@ func buildVolumeResizeArgs(vol *apis.LVMVolume, resizefs bool) []string {
 //     same size will not return any errors
 //  2. Triggering `lvextend <dev_path> -L <size>` more than one time will
 //     cause errors
+//
+// ResizeLVMVolume external interface, with lock
 func ResizeLVMVolume(ctx context.Context, vol *apis.LVMVolume, resizefs bool) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+	return resizeLVMVolumeInternal(ctx, vol, resizefs)
+}
 
+// resizeLVMVolumeInternal internal function, without lock (for CreateVolume etc.)
+func resizeLVMVolumeInternal(ctx context.Context, vol *apis.LVMVolume, resizefs bool) error {
 	// In case if resizefs is not enabled then check current size
 	// before exapnding LVM volume(If volume is already expanded then
 	// it might be error prone). This also makes ResizeLVMVolume func
@@ -1001,6 +1022,9 @@ func ListLVMLogicalVolume(ctx context.Context) ([]LogicalVolume, error) {
 
 // modified by sealos
 func ListLVMLogicalVolumeByVG(ctx context.Context, vg string, pool string) ([]LogicalVolume, error) {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
 	if err := ReloadLVMMetadataCache(ctx); err != nil {
 		return nil, err
 	}

@@ -594,7 +594,6 @@ func (o *Snapshotter) getCleanupLvNames(ctx context.Context) ([]string, error) {
 }
 
 func (o *Snapshotter) resizeLVMVolume(ctx context.Context, lvName, useLimit string) error {
-
 	capacity, err := parseUseLimit(useLimit)
 	if err != nil {
 		return fmt.Errorf("failed to parse use limit %s: %w", useLimit, err)

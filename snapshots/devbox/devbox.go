@@ -482,10 +482,7 @@ func (o *Snapshotter) Cleanup(ctx context.Context) error {
 	}
 
 	for _, lvName := range cleanupLv {
-		if err := o.unmountLvm(ctx, lvName); err != nil {
-			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Cleanup: failed to unmount LVM logical volume before removal")
-			continue
-		}
+
 		if err := o.removeLv(ctx, lvName); err != nil {
 			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Cleanup: failed to destroy LVM logical volume")
 			continue
@@ -514,6 +511,28 @@ func (o *Snapshotter) cleanupDirectories(ctx context.Context) (_ []string, _ []s
 		return nil
 	}); err != nil {
 		return nil, nil, err
+	}
+
+	// Unmount any mounted LVs outside of the transaction to avoid blocking
+	// This handles cases where containers exited but unmount failed
+	for _, lvName := range removedLvNames {
+		devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
+		mountPoint, err := findMountPointByDevice(devicePath)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).WithField("devicePath", devicePath).
+				Warn("Cleanup: failed to find mount point for LV, continuing")
+			continue
+		}
+		if mountPoint != "" {
+			// LV is mounted, unmount it before deletion
+			if err := o.unmountLvm(ctx, mountPoint); err != nil {
+				log.G(ctx).WithError(err).WithField("lvName", lvName).WithField("mountPoint", mountPoint).
+					Warn("Cleanup: failed to unmount LV before cleanup, will retry on next cleanup")
+				// Continue anyway, the LV will be retried on next cleanup
+			} else {
+				log.G(ctx).Infof("Cleanup: successfully unmounted LV %s from %s", lvName, mountPoint)
+			}
+		}
 	}
 
 	return cleanupDirs, removedLvNames, nil
@@ -595,6 +614,58 @@ func (o *Snapshotter) resizeLVMVolume(ctx context.Context, lvName, useLimit stri
 	}
 
 	return lvm.ResizeLVMVolume(ctx, vol, true)
+}
+
+// findMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
+// Returns the mount point path if found, empty string if not mounted, and error on failure
+func findMountPointByDevice(devicePath string) (string, error) {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", fmt.Errorf("failed to read /proc/mounts: %w", err)
+	}
+
+	// Parse /proc/mounts: format is "device mountpoint fstype options freq passno"
+	mounts := strings.Split(string(data), "\n")
+	for _, mount := range mounts {
+		if len(mount) == 0 {
+			continue
+		}
+
+		fields := strings.Fields(mount)
+		if len(fields) < 2 {
+			continue
+		}
+
+		// fields[0] is the device path, fields[1] is the mount point
+		mountDevice := fields[0]
+		mountPoint := fields[1]
+
+		// Check if the device matches (handle both direct path and symlink resolution)
+		if mountDevice == devicePath {
+			return mountPoint, nil
+		}
+
+		// Resolve both paths and compare
+		resolvedDevicePath, err1 := filepath.EvalSymlinks(devicePath)
+		resolvedMountDevice, err2 := filepath.EvalSymlinks(mountDevice)
+
+		// If both resolve successfully, compare resolved paths
+		if err1 == nil && err2 == nil {
+			if resolvedDevicePath == resolvedMountDevice {
+				return mountPoint, nil
+			}
+		}
+
+		// Also check if one resolves to the other
+		if err1 == nil && resolvedDevicePath == mountDevice {
+			return mountPoint, nil
+		}
+		if err2 == nil && resolvedMountDevice == devicePath {
+			return mountPoint, nil
+		}
+	}
+
+	return "", nil
 }
 
 func isMountPoint(dir string) (bool, error) {

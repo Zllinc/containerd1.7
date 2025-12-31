@@ -400,7 +400,11 @@ func ForceDestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 	volume := vol.Spec.VolGroup + "/" + vol.Name
 
 	// check if the volume exists in metadata
-	exists, _ := CheckLVMMetadataExists(ctx, vol)
+	exists, err := CheckLVMMetadataExists(ctx, vol)
+	if err != nil {
+		klog.Errorf("ForceDestroyVolume: failed to check if volume (%s) exists in metadata: %v", volume, err)
+		return err
+	}
 	if !exists {
 		klog.Infof("ForceDestroyVolume: volume (%s) doesn't exist in metadata", volume)
 		return nil
@@ -436,7 +440,7 @@ func CheckLVMMetadataExists(ctx context.Context, vol *apis.LVMVolume) (bool, err
 	out, _, err := RunCommandSplit(ctx, LVList, args...)
 	if err != nil {
 		klog.Errorf("lvm: failed to check LVM metadata exists for volume %s: %v", vol.Name, err)
-		return false, nil
+		return false, err
 	}
 
 	output := strings.TrimSpace(string(out))

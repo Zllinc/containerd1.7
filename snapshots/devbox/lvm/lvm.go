@@ -366,7 +366,7 @@ func DestroyVolume(ctx context.Context, vol *apis.LVMVolume) error {
 		return err
 	}
 	if !volExists {
-		klog.Infof("DestroyVolume: volume (%s) doesn't exists, skipping its deletion", volume)
+		klog.Infof("DestroyVolume: volume (%s) doesn't exist, skipping its deletion", volume)
 		return nil
 	}
 

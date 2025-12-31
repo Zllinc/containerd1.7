@@ -253,9 +253,6 @@ func TestForceDestroyVolume_NonExistingLV(t *testing.T) {
 
 // TestForceDestroyVolume_Idempotent tests that force destroy is idempotent
 func TestForceDestroyVolume_Idempotent(t *testing.T) {
-	if os.Getenv("RUN_LVM_TESTS") != "true" {
-		t.Skip("Skipping LVM tests. Set RUN_LVM_TESTS=true to run")
-	}
 
 	ctx := context.Background()
 

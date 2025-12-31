@@ -1037,47 +1037,48 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 			ThinProvision: o.ThinPoolName,
 		},
 	}
+
+	// Track LV creation and mount status for cleanup
+	lvCreated := false
+	mounted := false
+
+	// Defer cleanup: unmount and force remove LV if any step fails
+	defer func() {
+		if err != nil && lvCreated {
+			if mounted {
+				// Unmount first if mounted
+				if unmountErr := o.unmountLvm(ctx, td); unmountErr != nil {
+					log.G(ctx).WithError(unmountErr).WithField("lvName", lvName).Warn("failed to unmount LVM logical volume during cleanup")
+				}
+			}
+			// Force remove the LV
+			if removeErr := o.forceRemoveLv(ctx, lvName); removeErr != nil {
+				log.G(ctx).WithError(removeErr).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume during cleanup")
+			}
+		}
+	}()
+
 	log.G(ctx).Debug("Creating LVM volume:", lvName, "with capacity:", capacity, "in volume group:", o.lvmVgName)
 	err = lvm.CreateVolume(ctx, vol)
 	if err != nil {
-		// If create fails, we should remove the LVM logical volume
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after create failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create LVM logical volume %s: %w", lvName, err)
 	}
+	lvCreated = true
 
 	if err = o.mkfs(lvName); err != nil {
-		// If mkfs fails, we should remove the LVM logical volume
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after mkfs failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create filesystem on LVM logical volume %s: %w", lvName, err)
 	}
 
 	if err = o.mountLvm(ctx, lvName, td); err != nil {
-		// If mount fails, we should remove the LVM logical volume
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after mount failure")
-		}
 		return td, lvName, fmt.Errorf("failed to mount LVM logical volume %s: %w", lvName, err)
 	}
+	mounted = true
 
 	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
-		// If fs dir creation fails, we should unmount the LVM logical volume and force destroy it
-		o.unmountLvm(ctx, td)
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after fs dir creation failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create fs directory: %w", err)
 	}
 
 	if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
-		// If work dir creation fails, we should unmount the LVM logical volume and force destroy it
-		o.unmountLvm(ctx, td)
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after work dir creation failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create work directory: %w", err)
 	}
 

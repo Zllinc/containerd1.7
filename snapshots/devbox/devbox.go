@@ -409,10 +409,10 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 			for _, lvName := range removedLvNames {
 				err := o.removeLv(ctx, lvName)
 				if err != nil {
-					log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume")
+					log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Remove: failed to destroy LVM logical volume")
 					continue
 				}
-				log.G(ctx).Infof("LVM logical volume %s removed successfully", lvName)
+				log.G(ctx).Infof("Remove: LVM logical volume %s removed successfully", lvName)
 			}
 		}
 	}()
@@ -482,14 +482,13 @@ func (o *Snapshotter) Cleanup(ctx context.Context) error {
 	}
 
 	for _, lvName := range cleanupLv {
-		err := o.removeLv(ctx, lvName)
-		if err != nil {
-			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume")
+
+		if err := o.removeLv(ctx, lvName); err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Cleanup: failed to destroy LVM logical volume")
 			continue
 		}
-		log.G(ctx).Infof("LVM logical volume %s removed successfully", lvName)
+		log.G(ctx).Infof("Cleanup: LVM logical volume %s removed successfully", lvName)
 	}
-
 	return nil
 }
 
@@ -512,6 +511,28 @@ func (o *Snapshotter) cleanupDirectories(ctx context.Context) (_ []string, _ []s
 		return nil
 	}); err != nil {
 		return nil, nil, err
+	}
+
+	// Unmount any mounted LVs outside of the transaction to avoid blocking
+	// This handles cases where containers exited but unmount failed
+	for _, lvName := range removedLvNames {
+		devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
+		mountPoint, err := findMountPointByDevice(devicePath)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).WithField("devicePath", devicePath).
+				Warn("Cleanup: failed to find mount point for LV, continuing")
+			continue
+		}
+		if mountPoint != "" {
+			// LV is mounted, unmount it before deletion
+			if err := o.unmountLvm(ctx, mountPoint); err != nil {
+				log.G(ctx).WithError(err).WithField("lvName", lvName).WithField("mountPoint", mountPoint).
+					Warn("Cleanup: failed to unmount LV before cleanup, will retry on next cleanup")
+				// Continue anyway, the LV will be retried on next cleanup
+			} else {
+				log.G(ctx).Infof("Cleanup: successfully unmounted LV %s from %s", lvName, mountPoint)
+			}
+		}
 	}
 
 	return cleanupDirs, removedLvNames, nil
@@ -595,25 +616,81 @@ func (o *Snapshotter) resizeLVMVolume(ctx context.Context, lvName, useLimit stri
 	return lvm.ResizeLVMVolume(ctx, vol, true)
 }
 
-func isMountPoint(dir string) (bool, error) {
-	// read /proc/mounts file
+// readProcMounts reads and parses /proc/mounts file
+// Returns a slice of mount entries, where each entry is a slice of fields from /proc/mounts
+func readProcMounts() ([][]string, error) {
 	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read /proc/mounts: %w", err)
+	}
+
+	var mounts [][]string
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		mounts = append(mounts, fields)
+	}
+
+	return mounts, nil
+}
+
+// findMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
+// Returns the mount point path if found, empty string if not mounted, and error on failure
+func findMountPointByDevice(devicePath string) (string, error) {
+	mounts, err := readProcMounts()
+	if err != nil {
+		return "", err
+	}
+
+	for _, fields := range mounts {
+		// fields[0] is the device path, fields[1] is the mount point
+		mountDevice := fields[0]
+		mountPoint := fields[1]
+
+		// Check if the device matches (handle both direct path and symlink resolution)
+		if mountDevice == devicePath {
+			return mountPoint, nil
+		}
+
+		// Resolve both paths and compare
+		resolvedDevicePath, err1 := filepath.EvalSymlinks(devicePath)
+		resolvedMountDevice, err2 := filepath.EvalSymlinks(mountDevice)
+
+		// If both resolve successfully, compare resolved paths
+		if err1 == nil && err2 == nil {
+			if resolvedDevicePath == resolvedMountDevice {
+				return mountPoint, nil
+			}
+		}
+
+		// Also check if one resolves to the other
+		if err1 == nil && resolvedDevicePath == mountDevice {
+			return mountPoint, nil
+		}
+		if err2 == nil && resolvedMountDevice == devicePath {
+			return mountPoint, nil
+		}
+	}
+
+	return "", nil
+}
+
+func isMountPoint(dir string) (bool, error) {
+	mounts, err := readProcMounts()
 	if err != nil {
 		return false, err
 	}
 
 	// check if the directory is in the mount list
-	mounts := strings.Split(string(data), "\n")
-	for _, mount := range mounts {
-		if len(mount) == 0 {
-			continue
-		}
-
-		fields := strings.Fields(mount)
-		if len(fields) < 2 {
-			continue
-		}
-
+	for _, fields := range mounts {
 		mountPoint := fields[1]
 		if mountPoint == dir {
 			return true, nil
@@ -924,6 +1001,19 @@ func (o *Snapshotter) removeLv(ctx context.Context, lvName string) error {
 	return lvm.DestroyVolume(ctx, vol)
 }
 
+// forceRemoveLv force destroys the lvm volume
+func (o *Snapshotter) forceRemoveLv(ctx context.Context, lvName string) error {
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			VolGroup: o.lvmVgName,
+		},
+	}
+	return lvm.ForceDestroyVolume(ctx, vol)
+}
+
 func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir string, contentKey string, useLimit string) (string, string, error) {
 	lvName := "devbox-" + contentKey
 
@@ -947,31 +1037,47 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 			ThinProvision: o.ThinPoolName,
 		},
 	}
+
+	// Track LV creation and mount status for cleanup
+	lvCreated := false
+	mounted := false
+
+	// Defer cleanup: unmount and force remove LV if any step fails
+	defer func() {
+		if err != nil && lvCreated {
+			if mounted {
+				// Unmount first if mounted
+				if unmountErr := o.unmountLvm(ctx, td); unmountErr != nil {
+					log.G(ctx).WithError(unmountErr).WithField("lvName", lvName).Warn("failed to unmount LVM logical volume during cleanup")
+				}
+			}
+			// Force remove the LV
+			if removeErr := o.forceRemoveLv(ctx, lvName); removeErr != nil {
+				log.G(ctx).WithError(removeErr).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume during cleanup")
+			}
+		}
+	}()
+
 	log.G(ctx).Debug("Creating LVM volume:", lvName, "with capacity:", capacity, "in volume group:", o.lvmVgName)
 	err = lvm.CreateVolume(ctx, vol)
 	if err != nil {
 		return td, lvName, fmt.Errorf("failed to create LVM logical volume %s: %w", lvName, err)
 	}
+	lvCreated = true
 
-	err = o.mkfs(lvName)
-	if err != nil {
-		// If mkfs fails, we should remove the LVM logical volume
-		if err1 := o.removeLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume after mkfs failure")
-		}
+	if err = o.mkfs(lvName); err != nil {
 		return td, lvName, fmt.Errorf("failed to create filesystem on LVM logical volume %s: %w", lvName, err)
 	}
-	err = o.mountLvm(ctx, lvName, td)
-	if err != nil {
-		// If mount fails, we should remove the LVM logical volume
-		if err1 := o.removeLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to destroy LVM logical volume after mount failure")
-		}
+
+	if err = o.mountLvm(ctx, lvName, td); err != nil {
 		return td, lvName, fmt.Errorf("failed to mount LVM logical volume %s: %w", lvName, err)
 	}
+	mounted = true
+
 	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
 		return td, lvName, fmt.Errorf("failed to create fs directory: %w", err)
 	}
+
 	if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
 		return td, lvName, fmt.Errorf("failed to create work directory: %w", err)
 	}

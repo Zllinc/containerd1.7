@@ -616,26 +616,41 @@ func (o *Snapshotter) resizeLVMVolume(ctx context.Context, lvName, useLimit stri
 	return lvm.ResizeLVMVolume(ctx, vol, true)
 }
 
-// findMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
-// Returns the mount point path if found, empty string if not mounted, and error on failure
-func findMountPointByDevice(devicePath string) (string, error) {
+// readProcMounts reads and parses /proc/mounts file
+// Returns a slice of mount entries, where each entry is a slice of fields from /proc/mounts
+func readProcMounts() ([][]string, error) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return "", fmt.Errorf("failed to read /proc/mounts: %w", err)
+		return nil, fmt.Errorf("failed to read /proc/mounts: %w", err)
 	}
 
-	// Parse /proc/mounts: format is "device mountpoint fstype options freq passno"
-	mounts := strings.Split(string(data), "\n")
-	for _, mount := range mounts {
-		if len(mount) == 0 {
+	var mounts [][]string
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if len(line) == 0 {
 			continue
 		}
 
-		fields := strings.Fields(mount)
+		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
 
+		mounts = append(mounts, fields)
+	}
+
+	return mounts, nil
+}
+
+// findMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
+// Returns the mount point path if found, empty string if not mounted, and error on failure
+func findMountPointByDevice(devicePath string) (string, error) {
+	mounts, err := readProcMounts()
+	if err != nil {
+		return "", err
+	}
+
+	for _, fields := range mounts {
 		// fields[0] is the device path, fields[1] is the mount point
 		mountDevice := fields[0]
 		mountPoint := fields[1]
@@ -669,24 +684,13 @@ func findMountPointByDevice(devicePath string) (string, error) {
 }
 
 func isMountPoint(dir string) (bool, error) {
-	// read /proc/mounts file
-	data, err := os.ReadFile("/proc/mounts")
+	mounts, err := readProcMounts()
 	if err != nil {
 		return false, err
 	}
 
 	// check if the directory is in the mount list
-	mounts := strings.Split(string(data), "\n")
-	for _, mount := range mounts {
-		if len(mount) == 0 {
-			continue
-		}
-
-		fields := strings.Fields(mount)
-		if len(fields) < 2 {
-			continue
-		}
-
+	for _, fields := range mounts {
 		mountPoint := fields[1]
 		if mountPoint == dir {
 			return true, nil

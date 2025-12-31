@@ -370,3 +370,360 @@ func TestFindMountPointAndUnmount_Concurrent(t *testing.T) {
 
 	t.Logf("Concurrent test passed: all %d goroutines completed successfully", numConcurrent)
 }
+
+// TestReadProcMounts tests the readProcMounts function
+// It creates an LV, mounts it, and verifies readProcMounts can read and parse /proc/mounts correctly
+func TestReadProcMounts(t *testing.T) {
+	ctx := context.Background()
+
+	// Generate a unique LV name for this test
+	lvName := fmt.Sprintf("test-read-proc-mounts-%d", os.Getpid())
+
+	// Create the test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Clean up LV at the end
+	defer func() {
+		if err := lvm.ForceDestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to clean up test LV %s: %v", lvName, err)
+		}
+	}()
+
+	// Step 1: Create the LV
+	t.Logf("Step 1: Creating LV %s", lvName)
+	if err := lvm.CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
+
+	// Verify LV exists
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		t.Fatalf("LVM logical volume %s does not exist: %v", devicePath, err)
+	}
+
+	// Step 2: Format the filesystem
+	t.Logf("Step 2: Formatting filesystem on %s", devicePath)
+	cmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to create filesystem on %s: %v, output: %s", devicePath, err, string(output))
+	}
+
+	// Step 3: Create a temporary mount point
+	tmpRoot, err := os.MkdirTemp("", "devbox-test-read-proc-")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	mountPoint := filepath.Join(tmpRoot, "mount-point")
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		t.Fatalf("Failed to create mount point directory: %v", err)
+	}
+
+	// Step 4: Mount the LV
+	t.Logf("Step 4: Mounting %s to %s", devicePath, mountPoint)
+	if err := syscall.Mount(devicePath, mountPoint, "ext4", 0, ""); err != nil {
+		t.Fatalf("Failed to mount %s to %s: %v", devicePath, mountPoint, err)
+	}
+	defer func() {
+		if err := syscall.Unmount(mountPoint, 0); err != nil {
+			t.Logf("Warning: Failed to unmount %s during cleanup: %v", mountPoint, err)
+		}
+	}()
+
+	// Step 5: Test readProcMounts
+	t.Logf("Step 5: Testing readProcMounts")
+	mounts, err := readProcMounts()
+	if err != nil {
+		t.Fatalf("readProcMounts failed: %v", err)
+	}
+
+	if len(mounts) == 0 {
+		t.Fatal("readProcMounts returned empty slice, expected at least one mount entry")
+	}
+
+	// Verify the mounted LV is in the results
+	found := false
+	for _, mount := range mounts {
+		if len(mount) < 2 {
+			continue
+		}
+		mountDevice := mount[0]
+		mountPointFromProc := mount[1]
+
+		// Check if this is our mount
+		if mountPointFromProc == mountPoint {
+			found = true
+			t.Logf("Found mount entry: device=%s, mountpoint=%s", mountDevice, mountPointFromProc)
+			// Verify device path matches (may be symlink, so check both)
+			if mountDevice == devicePath {
+				t.Logf("Device path matches directly: %s", devicePath)
+			} else {
+				// Check if it's a symlink resolution
+				resolvedDevice, err := filepath.EvalSymlinks(devicePath)
+				if err == nil && resolvedDevice == mountDevice {
+					t.Logf("Device path matches via symlink: %s -> %s", devicePath, resolvedDevice)
+				}
+			}
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("readProcMounts did not find mount point %s in results", mountPoint)
+		t.Logf("Available mount points (first 10):")
+		for i, mount := range mounts {
+			if i >= 10 {
+				break
+			}
+			if len(mount) >= 2 {
+				t.Logf("  %s -> %s", mount[0], mount[1])
+			}
+		}
+	}
+
+	t.Logf("Test passed: readProcMounts successfully read and parsed /proc/mounts")
+}
+
+// TestIsMountPoint tests the isMountPoint function
+// It creates an LV, mounts it, and verifies isMountPoint can correctly identify mount points
+func TestIsMountPoint(t *testing.T) {
+	ctx := context.Background()
+
+	// Generate a unique LV name for this test
+	lvName := fmt.Sprintf("test-is-mount-point-%d", os.Getpid())
+
+	// Create the test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Clean up LV at the end
+	defer func() {
+		if err := lvm.ForceDestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to clean up test LV %s: %v", lvName, err)
+		}
+	}()
+
+	// Step 1: Create the LV
+	t.Logf("Step 1: Creating LV %s", lvName)
+	if err := lvm.CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
+
+	// Verify LV exists
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		t.Fatalf("LVM logical volume %s does not exist: %v", devicePath, err)
+	}
+
+	// Step 2: Format the filesystem
+	t.Logf("Step 2: Formatting filesystem on %s", devicePath)
+	cmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to create filesystem on %s: %v, output: %s", devicePath, err, string(output))
+	}
+
+	// Step 3: Create temporary directories
+	tmpRoot, err := os.MkdirTemp("", "devbox-test-is-mount-")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	mountPoint := filepath.Join(tmpRoot, "mount-point")
+	nonMountPoint := filepath.Join(tmpRoot, "non-mount-point")
+
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		t.Fatalf("Failed to create mount point directory: %v", err)
+	}
+	if err := os.MkdirAll(nonMountPoint, 0755); err != nil {
+		t.Fatalf("Failed to create non-mount point directory: %v", err)
+	}
+
+	// Step 4: Test isMountPoint on non-mounted directory (should return false)
+	t.Logf("Step 4: Testing isMountPoint on non-mounted directory")
+	isMounted, err := isMountPoint(nonMountPoint)
+	if err != nil {
+		t.Fatalf("isMountPoint failed: %v", err)
+	}
+	if isMounted {
+		t.Errorf("isMountPoint returned true for non-mounted directory %s", nonMountPoint)
+	} else {
+		t.Logf("Correctly identified %s as not a mount point", nonMountPoint)
+	}
+
+	// Step 5: Mount the LV
+	t.Logf("Step 5: Mounting %s to %s", devicePath, mountPoint)
+	if err := syscall.Mount(devicePath, mountPoint, "ext4", 0, ""); err != nil {
+		t.Fatalf("Failed to mount %s to %s: %v", devicePath, mountPoint, err)
+	}
+	defer func() {
+		if err := syscall.Unmount(mountPoint, 0); err != nil {
+			t.Logf("Warning: Failed to unmount %s during cleanup: %v", mountPoint, err)
+		}
+	}()
+
+	// Step 6: Test isMountPoint on mounted directory (should return true)
+	t.Logf("Step 6: Testing isMountPoint on mounted directory")
+	isMounted, err = isMountPoint(mountPoint)
+	if err != nil {
+		t.Fatalf("isMountPoint failed: %v", err)
+	}
+	if !isMounted {
+		t.Errorf("isMountPoint returned false for mounted directory %s", mountPoint)
+	} else {
+		t.Logf("Correctly identified %s as a mount point", mountPoint)
+	}
+
+	// Step 7: Unmount and verify isMountPoint returns false
+	t.Logf("Step 7: Unmounting and verifying isMountPoint returns false")
+	if err := syscall.Unmount(mountPoint, 0); err != nil {
+		t.Fatalf("Failed to unmount %s: %v", mountPoint, err)
+	}
+
+	isMounted, err = isMountPoint(mountPoint)
+	if err != nil {
+		t.Fatalf("isMountPoint failed after unmount: %v", err)
+	}
+	if isMounted {
+		t.Errorf("isMountPoint returned true for unmounted directory %s", mountPoint)
+	} else {
+		t.Logf("Correctly identified %s as not a mount point after unmount", mountPoint)
+	}
+
+	t.Logf("Test passed: isMountPoint correctly identifies mount points")
+}
+
+// TestFindMountPointByDevice tests the findMountPointByDevice function
+// It creates an LV, mounts it, and verifies findMountPointByDevice can find the mount point
+func TestFindMountPointByDevice(t *testing.T) {
+	ctx := context.Background()
+
+	// Generate a unique LV name for this test
+	lvName := fmt.Sprintf("test-find-mount-point-%d", os.Getpid())
+
+	// Create the test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Clean up LV at the end
+	defer func() {
+		if err := lvm.ForceDestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to clean up test LV %s: %v", lvName, err)
+		}
+	}()
+
+	// Step 1: Create the LV
+	t.Logf("Step 1: Creating LV %s", lvName)
+	if err := lvm.CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
+
+	// Verify LV exists
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		t.Fatalf("LVM logical volume %s does not exist: %v", devicePath, err)
+	}
+
+	// Step 2: Test findMountPointByDevice on unmounted device (should return empty)
+	t.Logf("Step 2: Testing findMountPointByDevice on unmounted device")
+	mountPoint, err := findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed: %v", err)
+	}
+	if mountPoint != "" {
+		t.Errorf("findMountPointByDevice returned mount point %s for unmounted device %s", mountPoint, devicePath)
+	} else {
+		t.Logf("Correctly returned empty string for unmounted device %s", devicePath)
+	}
+
+	// Step 3: Format the filesystem
+	t.Logf("Step 3: Formatting filesystem on %s", devicePath)
+	cmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to create filesystem on %s: %v, output: %s", devicePath, err, string(output))
+	}
+
+	// Step 4: Create a temporary mount point
+	tmpRoot, err := os.MkdirTemp("", "devbox-test-find-mount-")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	expectedMountPoint := filepath.Join(tmpRoot, "mount-point")
+	if err := os.MkdirAll(expectedMountPoint, 0755); err != nil {
+		t.Fatalf("Failed to create mount point directory: %v", err)
+	}
+
+	// Step 5: Mount the LV
+	t.Logf("Step 5: Mounting %s to %s", devicePath, expectedMountPoint)
+	if err := syscall.Mount(devicePath, expectedMountPoint, "ext4", 0, ""); err != nil {
+		t.Fatalf("Failed to mount %s to %s: %v", devicePath, expectedMountPoint, err)
+	}
+	defer func() {
+		if err := syscall.Unmount(expectedMountPoint, 0); err != nil {
+			t.Logf("Warning: Failed to unmount %s during cleanup: %v", expectedMountPoint, err)
+		}
+	}()
+
+	// Step 6: Test findMountPointByDevice on mounted device
+	t.Logf("Step 6: Testing findMountPointByDevice on mounted device")
+	mountPoint, err = findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed: %v", err)
+	}
+	if mountPoint == "" {
+		t.Errorf("findMountPointByDevice returned empty string for mounted device %s", devicePath)
+	} else if mountPoint != expectedMountPoint {
+		t.Errorf("findMountPointByDevice returned wrong mount point: expected %s, got %s", expectedMountPoint, mountPoint)
+	} else {
+		t.Logf("Successfully found mount point: %s", mountPoint)
+	}
+
+	// Step 7: Unmount and verify findMountPointByDevice returns empty
+	t.Logf("Step 7: Unmounting and verifying findMountPointByDevice returns empty")
+	if err := syscall.Unmount(expectedMountPoint, 0); err != nil {
+		t.Fatalf("Failed to unmount %s: %v", expectedMountPoint, err)
+	}
+
+	mountPoint, err = findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed after unmount: %v", err)
+	}
+	if mountPoint != "" {
+		t.Errorf("findMountPointByDevice returned mount point %s for unmounted device %s", mountPoint, devicePath)
+	} else {
+		t.Logf("Correctly returned empty string for unmounted device %s", devicePath)
+	}
+
+	t.Logf("Test passed: findMountPointByDevice correctly finds mount points")
+}

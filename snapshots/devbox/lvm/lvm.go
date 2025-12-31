@@ -478,7 +478,7 @@ func UnmountVolume(mountPath string) error {
 	defer lvmLock.Unlock()
 
 	// check if the path is a mount point
-	isMounted, err := isMountPoint(mountPath)
+	isMounted, err := IsMountPoint(mountPath)
 	if err != nil {
 		return fmt.Errorf("failed to check if %s is a mount point: %w", mountPath, err)
 	}
@@ -499,7 +499,7 @@ func UnmountVolume(mountPath string) error {
 }
 
 // isMountPoint checks if a directory is a mount point
-func isMountPoint(dir string) (bool, error) {
+func IsMountPoint(dir string) (bool, error) {
 	// check if the directory exists
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return false, nil

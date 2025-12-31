@@ -366,7 +366,7 @@ func (o *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 }
 
 func (o *Snapshotter) RemoveDir(ctx context.Context, dir string) {
-	isMounted, err := isMountPoint(dir)
+	isMounted, err := lvm.IsMountPoint(dir)
 	if err != nil {
 		log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to check if path is a mount point")
 		return
@@ -723,6 +723,7 @@ func (o *Snapshotter) mkfs(lvName string) error {
 func (o *Snapshotter) mountLvm(ctx context.Context, lvName string, path string) error {
 	devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
 	if err := lvm.MountVolume(devicePath, path, "ext4", 0, ""); err != nil {
+		log.G(ctx).WithError(err).WithField("devicePath", devicePath).WithField("path", path).Warn("failed to mount LVM logical volume")
 		return fmt.Errorf("failed to mount LVM logical volume %s to %s: %w", devicePath, path, err)
 	}
 	return nil
@@ -730,7 +731,11 @@ func (o *Snapshotter) mountLvm(ctx context.Context, lvName string, path string) 
 
 // unmountLvm unmounts the LVM logical volume
 func (o *Snapshotter) unmountLvm(ctx context.Context, path string) error {
-	return lvm.UnmountVolume(path)
+	if err := lvm.UnmountVolume(path); err != nil {
+		log.G(ctx).WithError(err).WithField("path", path).Warn("failed to unmount LVM logical volume")
+		return fmt.Errorf("failed to unmount LVM logical volume %s: %w", path, err)
+	}
+	return nil
 }
 
 // end modified by sealos
@@ -795,7 +800,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 				// mount point for the snapshot
 				log.G(ctx).Debug("LVM logical volume name found for content ID:", contentID, "is", lvName)
 				var isMounted bool
-				if isMounted, err = isMountPoint(npath); err != nil {
+				if isMounted, err = lvm.IsMountPoint(npath); err != nil {
 					return fmt.Errorf("failed to check if path is a mount point: %w", err)
 				} else if isMounted {
 					log.G(ctx).Infof("Path %s is already mounted, skipping mount", npath)

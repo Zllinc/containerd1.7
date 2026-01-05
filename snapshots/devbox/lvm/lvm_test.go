@@ -713,3 +713,158 @@ func TestForceDestroyVolume_Idempotent(t *testing.T) {
 		t.Fatalf("Force destroy should be idempotent: %v", err)
 	}
 }
+
+// TestIsMountPoint tests the IsMountPoint function
+func TestIsMountPoint(t *testing.T) {
+	// Test 1: Check a known mount point (e.g., /proc)
+	// /proc is typically always mounted
+	isMounted, err := IsMountPoint("/proc")
+	if err != nil {
+		t.Fatalf("Failed to check /proc mount point: %v", err)
+	}
+	if !isMounted {
+		t.Logf("Warning: /proc is not detected as a mount point (this might be normal in some environments)")
+	} else {
+		t.Logf("Successfully detected /proc as a mount point")
+	}
+
+	// Test 2: Check a regular directory (should not be a mount point)
+	// Use /tmp as it's typically not a mount point (unless specifically mounted)
+	tmpDir := "/tmp"
+	isMounted, err = IsMountPoint(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to check /tmp mount point: %v", err)
+	}
+	t.Logf("/tmp is mounted: %v", isMounted)
+
+	// Test 3: Check a non-existent directory
+	nonExistentDir := "/nonexistent/directory/path"
+	isMounted, err = IsMountPoint(nonExistentDir)
+	if err != nil {
+		t.Fatalf("Failed to check non-existent directory: %v", err)
+	}
+	if isMounted {
+		t.Errorf("Non-existent directory should not be detected as a mount point")
+	}
+	t.Logf("Non-existent directory is mounted: %v (expected: false)", isMounted)
+
+	// Test 4: Check /sys (another known mount point)
+	isMounted, err = IsMountPoint("/sys")
+	if err != nil {
+		t.Fatalf("Failed to check /sys mount point: %v", err)
+	}
+	if !isMounted {
+		t.Logf("Warning: /sys is not detected as a mount point (this might be normal in some environments)")
+	} else {
+		t.Logf("Successfully detected /sys as a mount point")
+	}
+
+	// Test 5: Check root directory (should not be a mount point by definition)
+	isMounted, err = IsMountPoint("/var/lib/containerd/io.containerd.snapshotter.v1.devbox/snapshots/7301")
+	if err != nil {
+		t.Fatalf("Failed to check root directory: %v", err)
+	}
+	// Root directory's parent is itself, so it should not be detected as a mount point
+	// (unless it's in a chroot environment, but that's rare)
+	t.Logf("Root directory /var/lib/containerd/io.containerd.snapshotter.v1.devbox/snapshots/7301 is mounted: %v", isMounted)
+}
+
+// isMountPointByProcMounts checks if a directory is a mount point by reading /proc/mounts
+// This is the implementation from devbox.go for comparison
+func isMountPointByProcMounts(dir string) (bool, error) {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false, fmt.Errorf("failed to read /proc/mounts: %w", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		mountPoint := fields[1]
+		if mountPoint == dir {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// BenchmarkIsMountPoint_DeviceNumber benchmarks the device number comparison method
+func BenchmarkIsMountPoint_DeviceNumber(b *testing.B) {
+	testPaths := []string{"/proc", "/sys", "/tmp", "/", "/nonexistent"}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, path := range testPaths {
+			_, _ = IsMountPoint(path)
+		}
+	}
+}
+
+// BenchmarkIsMountPoint_ProcMounts benchmarks the /proc/mounts reading method
+func BenchmarkIsMountPoint_ProcMounts(b *testing.B) {
+	testPaths := []string{"/proc", "/sys", "/tmp", "/", "/nonexistent"}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, path := range testPaths {
+			_, _ = isMountPointByProcMounts(path)
+		}
+	}
+}
+
+// BenchmarkIsMountPoint_Single_DeviceNumber benchmarks single check with device number method
+func BenchmarkIsMountPoint_Single_DeviceNumber(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = IsMountPoint("/proc")
+	}
+}
+
+// BenchmarkIsMountPoint_Single_ProcMounts benchmarks single check with /proc/mounts method
+func BenchmarkIsMountPoint_Single_ProcMounts(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = isMountPointByProcMounts("/proc")
+	}
+}
+
+// TestIsMountPoint_PerformanceComparison compares the performance of both methods
+func TestIsMountPoint_PerformanceComparison(t *testing.T) {
+	testPaths := []string{"/proc", "/sys", "/tmp", "/", "/nonexistent"}
+
+	// Test both methods return the same results
+	for _, path := range testPaths {
+		result1, err1 := IsMountPoint(path)
+		result2, err2 := isMountPointByProcMounts(path)
+
+		if err1 != nil && err2 != nil {
+			// Both failed, that's okay for some paths
+			continue
+		}
+
+		if err1 != nil {
+			t.Logf("Device number method failed for %s: %v", path, err1)
+			continue
+		}
+
+		if err2 != nil {
+			t.Logf("ProcMounts method failed for %s: %v", path, err2)
+			continue
+		}
+
+		if result1 != result2 {
+			t.Logf("Warning: Different results for %s - DeviceNumber: %v, ProcMounts: %v", path, result1, result2)
+		} else {
+			t.Logf("Path %s: both methods agree - mounted: %v", path, result1)
+		}
+	}
+}

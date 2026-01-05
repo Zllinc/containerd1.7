@@ -498,6 +498,60 @@ func UnmountVolume(mountPath string) error {
 	return nil
 }
 
+// FindMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
+// Returns the mount point path if found, empty string if not mounted, and error on failure
+func FindMountPointByDevice(devicePath string) (string, error) {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", fmt.Errorf("failed to read /proc/mounts: %w", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		// fields[0] is the device path, fields[1] is the mount point
+		mountDevice := fields[0]
+		mountPoint := fields[1]
+
+		// Check if the device matches (handle both direct path and symlink resolution)
+		if mountDevice == devicePath {
+			return mountPoint, nil
+		}
+
+		// Resolve both paths and compare
+		resolvedDevicePath, err1 := filepath.EvalSymlinks(devicePath)
+		resolvedMountDevice, err2 := filepath.EvalSymlinks(mountDevice)
+
+		// If both resolve successfully, compare resolved paths
+		if err1 == nil && err2 == nil {
+			if resolvedDevicePath == resolvedMountDevice {
+				return mountPoint, nil
+			}
+		}
+
+		// Also check if one resolves to the other
+		if err1 == nil && resolvedDevicePath == mountDevice {
+			return mountPoint, nil
+		}
+		if err2 == nil && resolvedMountDevice == devicePath {
+			return mountPoint, nil
+		}
+	}
+
+	return "", nil
+}
+
 // isMountPoint checks if a directory is a mount point
 func IsMountPoint(dir string) (bool, error) {
 	// check if the directory exists

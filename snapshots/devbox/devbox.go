@@ -508,8 +508,7 @@ func (o *Snapshotter) cleanupDirectories(ctx context.Context) (_ []string, _ []s
 			return err
 		}
 
-		// Unmount any mounted LVs outside of the transaction to avoid blocking
-		// This handles cases where containers exited but unmount failed
+		// Unmount any mounted LVs
 		for _, lvName := range removedLvNames {
 			devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
 			mountPoints, err := findMountPointByDevice(devicePath)

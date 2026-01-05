@@ -125,17 +125,20 @@ func TestFindMountPointAndUnmount(t *testing.T) {
 
 	// Step 5: Test findMountPointByDevice
 	t.Logf("Step 5: Testing findMountPointByDevice for %s", devicePath)
-	foundMountPoint, err := findMountPointByDevice(devicePath)
+	foundMountPoints, err := findMountPointByDevice(devicePath)
 	if err != nil {
 		t.Fatalf("findMountPointByDevice failed: %v", err)
 	}
-	if foundMountPoint == "" {
-		t.Fatal("findMountPointByDevice should have found the mount point, but returned empty string")
+	if len(foundMountPoints) == 0 {
+		t.Fatal("findMountPointByDevice should have found the mount point, but returned empty slice")
 	}
-	if foundMountPoint != mountPoint {
-		t.Fatalf("findMountPointByDevice returned wrong mount point: expected %s, got %s", mountPoint, foundMountPoint)
+	if len(foundMountPoints) != 1 {
+		t.Fatalf("findMountPointByDevice should return exactly 1 mount point, but got %d: %v", len(foundMountPoints), foundMountPoints)
 	}
-	t.Logf("Successfully found mount point: %s", foundMountPoint)
+	if foundMountPoints[0] != mountPoint {
+		t.Fatalf("findMountPointByDevice returned wrong mount point: expected %s, got %s", mountPoint, foundMountPoints[0])
+	}
+	t.Logf("Successfully found mount point: %s", foundMountPoints[0])
 
 	// Step 6: Test unmountLvm
 	t.Logf("Step 6: Testing unmountLvm for %s", mountPoint)
@@ -147,12 +150,12 @@ func TestFindMountPointAndUnmount(t *testing.T) {
 
 	// Step 7: Verify the mount point is no longer mounted
 	t.Logf("Step 7: Verifying mount point is no longer mounted")
-	foundMountPoint, err = findMountPointByDevice(devicePath)
+	foundMountPoints, err = findMountPointByDevice(devicePath)
 	if err != nil {
 		t.Fatalf("findMountPointByDevice failed after unmount: %v", err)
 	}
-	if foundMountPoint != "" {
-		t.Fatalf("findMountPointByDevice should return empty string after unmount, but got %s", foundMountPoint)
+	if len(foundMountPoints) != 0 {
+		t.Fatalf("findMountPointByDevice should return empty slice after unmount, but got %d mount points: %v", len(foundMountPoints), foundMountPoints)
 	}
 	t.Logf("Verified: mount point is no longer mounted")
 
@@ -191,15 +194,15 @@ func TestFindMountPointByDevice_UnmountedDevice(t *testing.T) {
 	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
 
 	// Test findMountPointByDevice on an unmounted device
-	mountPoint, err := findMountPointByDevice(devicePath)
+	mountPoints, err := findMountPointByDevice(devicePath)
 	if err != nil {
 		t.Fatalf("findMountPointByDevice failed: %v", err)
 	}
-	if mountPoint != "" {
-		t.Fatalf("findMountPointByDevice should return empty string for unmounted device, but got %s", mountPoint)
+	if len(mountPoints) != 0 {
+		t.Fatalf("findMountPointByDevice should return empty slice for unmounted device, but got %d mount points: %v", len(mountPoints), mountPoints)
 	}
 
-	t.Logf("Test passed: unmounted device correctly returns empty mount point")
+	t.Logf("Test passed: unmounted device correctly returns empty mount point slice")
 }
 
 // TestFindMountPointAndUnmount_Concurrent tests the findMountPointByDevice and unmountLvm
@@ -304,17 +307,21 @@ func TestFindMountPointAndUnmount_Concurrent(t *testing.T) {
 			}()
 
 			// Step 5: Test findMountPointByDevice (concurrent access)
-			foundMountPoint, err := findMountPointByDevice(devicePath)
+			foundMountPoints, err := findMountPointByDevice(devicePath)
 			if err != nil {
 				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice failed: %w", index, err)
 				return
 			}
-			if foundMountPoint == "" {
+			if len(foundMountPoints) == 0 {
 				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice should have found mount point for %s", index, devicePath)
 				return
 			}
-			if foundMountPoint != mountPoint {
-				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice returned wrong mount point: expected %s, got %s", index, mountPoint, foundMountPoint)
+			if len(foundMountPoints) != 1 {
+				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice should return exactly 1 mount point, but got %d: %v", index, len(foundMountPoints), foundMountPoints)
+				return
+			}
+			if foundMountPoints[0] != mountPoint {
+				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice returned wrong mount point: expected %s, got %s", index, mountPoint, foundMountPoints[0])
 				return
 			}
 
@@ -326,13 +333,13 @@ func TestFindMountPointAndUnmount_Concurrent(t *testing.T) {
 			mounted = false // Mark as unmounted so defer doesn't try again
 
 			// Step 7: Verify the mount point is no longer mounted
-			foundMountPoint, err = findMountPointByDevice(devicePath)
+			foundMountPoints, err = findMountPointByDevice(devicePath)
 			if err != nil {
 				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice failed after unmount: %w", index, err)
 				return
 			}
-			if foundMountPoint != "" {
-				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice should return empty string after unmount, but got %s", index, foundMountPoint)
+			if len(foundMountPoints) != 0 {
+				errorChan <- fmt.Errorf("goroutine %d: findMountPointByDevice should return empty slice after unmount, but got %d mount points: %v", index, len(foundMountPoints), foundMountPoints)
 				return
 			}
 
@@ -654,14 +661,14 @@ func TestFindMountPointByDevice(t *testing.T) {
 
 	// Step 2: Test findMountPointByDevice on unmounted device (should return empty)
 	t.Logf("Step 2: Testing findMountPointByDevice on unmounted device")
-	mountPoint, err := findMountPointByDevice(devicePath)
+	mountPoints, err := findMountPointByDevice(devicePath)
 	if err != nil {
 		t.Fatalf("findMountPointByDevice failed: %v", err)
 	}
-	if mountPoint != "" {
-		t.Errorf("findMountPointByDevice returned mount point %s for unmounted device %s", mountPoint, devicePath)
+	if len(mountPoints) != 0 {
+		t.Errorf("findMountPointByDevice returned %d mount points for unmounted device %s: %v", len(mountPoints), devicePath, mountPoints)
 	} else {
-		t.Logf("Correctly returned empty string for unmounted device %s", devicePath)
+		t.Logf("Correctly returned empty slice for unmounted device %s", devicePath)
 	}
 
 	// Step 3: Format the filesystem
@@ -697,16 +704,18 @@ func TestFindMountPointByDevice(t *testing.T) {
 
 	// Step 6: Test findMountPointByDevice on mounted device
 	t.Logf("Step 6: Testing findMountPointByDevice on mounted device")
-	mountPoint, err = findMountPointByDevice(devicePath)
+	mountPoints, err = findMountPointByDevice(devicePath)
 	if err != nil {
 		t.Fatalf("findMountPointByDevice failed: %v", err)
 	}
-	if mountPoint == "" {
-		t.Errorf("findMountPointByDevice returned empty string for mounted device %s", devicePath)
-	} else if mountPoint != expectedMountPoint {
-		t.Errorf("findMountPointByDevice returned wrong mount point: expected %s, got %s", expectedMountPoint, mountPoint)
+	if len(mountPoints) == 0 {
+		t.Errorf("findMountPointByDevice returned empty slice for mounted device %s", devicePath)
+	} else if len(mountPoints) != 1 {
+		t.Errorf("findMountPointByDevice should return exactly 1 mount point, but got %d: %v", len(mountPoints), mountPoints)
+	} else if mountPoints[0] != expectedMountPoint {
+		t.Errorf("findMountPointByDevice returned wrong mount point: expected %s, got %s", expectedMountPoint, mountPoints[0])
 	} else {
-		t.Logf("Successfully found mount point: %s", mountPoint)
+		t.Logf("Successfully found mount point: %s", mountPoints[0])
 	}
 
 	// Step 7: Unmount and verify findMountPointByDevice returns empty
@@ -715,15 +724,295 @@ func TestFindMountPointByDevice(t *testing.T) {
 		t.Fatalf("Failed to unmount %s: %v", expectedMountPoint, err)
 	}
 
-	mountPoint, err = findMountPointByDevice(devicePath)
+	mountPoints, err = findMountPointByDevice(devicePath)
 	if err != nil {
 		t.Fatalf("findMountPointByDevice failed after unmount: %v", err)
 	}
-	if mountPoint != "" {
-		t.Errorf("findMountPointByDevice returned mount point %s for unmounted device %s", mountPoint, devicePath)
+	if len(mountPoints) != 0 {
+		t.Errorf("findMountPointByDevice returned %d mount points for unmounted device %s: %v", len(mountPoints), devicePath, mountPoints)
 	} else {
-		t.Logf("Correctly returned empty string for unmounted device %s", devicePath)
+		t.Logf("Correctly returned empty slice for unmounted device %s", devicePath)
 	}
 
 	t.Logf("Test passed: findMountPointByDevice correctly finds mount points")
+}
+
+// TestFindMountPointByDevice_MultipleMountPoints tests that findMountPointByDevice
+// can find all mount points when a device is mounted to multiple directories
+func TestFindMountPointByDevice_MultipleMountPoints(t *testing.T) {
+	ctx := context.Background()
+
+	// Generate a unique LV name for this test
+	lvName := fmt.Sprintf("test-multi-mount-%d", os.Getpid())
+
+	// Create the test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Clean up LV at the end
+	defer func() {
+		if err := lvm.ForceDestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to clean up test LV %s: %v", lvName, err)
+		}
+	}()
+
+	// Step 1: Create the LV
+	t.Logf("Step 1: Creating LV %s", lvName)
+	if err := lvm.CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
+
+	// Verify LV exists
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		t.Fatalf("LVM logical volume %s does not exist: %v", devicePath, err)
+	}
+
+	// Step 2: Format the filesystem
+	t.Logf("Step 2: Formatting filesystem on %s", devicePath)
+	cmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to create filesystem on %s: %v, output: %s", devicePath, err, string(output))
+	}
+
+	// Step 3: Create temporary directory for mount points
+	tmpRoot, err := os.MkdirTemp("", "devbox-test-multi-mount-")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	// Step 4: Create 5 mount point directories
+	numMountPoints := 5
+	expectedMountPoints := make([]string, numMountPoints)
+	for i := 0; i < numMountPoints; i++ {
+		mountPoint := filepath.Join(tmpRoot, fmt.Sprintf("mount-point-%d", i))
+		if err := os.MkdirAll(mountPoint, 0755); err != nil {
+			t.Fatalf("Failed to create mount point directory %s: %v", mountPoint, err)
+		}
+		expectedMountPoints[i] = mountPoint
+	}
+
+	// Step 5: Mount the LV to all 5 directories
+	t.Logf("Step 5: Mounting %s to %d directories", devicePath, numMountPoints)
+	mountedPoints := make([]string, 0, numMountPoints)
+	for i, mountPoint := range expectedMountPoints {
+		t.Logf("  Mounting to %s", mountPoint)
+		if err := syscall.Mount(devicePath, mountPoint, "ext4", 0, ""); err != nil {
+			t.Fatalf("Failed to mount %s to %s: %v", devicePath, mountPoint, err)
+		}
+		mountedPoints = append(mountedPoints, mountPoint)
+
+		// Verify it's mounted after each mount
+		mountPoints, err := findMountPointByDevice(devicePath)
+		if err != nil {
+			t.Fatalf("findMountPointByDevice failed after mounting to %s: %v", mountPoint, err)
+		}
+		if len(mountPoints) != i+1 {
+			t.Errorf("After mounting to %s, expected %d mount points, got %d", mountPoint, i+1, len(mountPoints))
+		}
+	}
+
+	// Ensure all mounts are unmounted at the end
+	defer func() {
+		for _, mountPoint := range mountedPoints {
+			if err := syscall.Unmount(mountPoint, 0); err != nil {
+				t.Logf("Warning: Failed to unmount %s during cleanup: %v", mountPoint, err)
+			}
+		}
+	}()
+
+	// Step 6: Test findMountPointByDevice finds all mount points
+	t.Logf("Step 6: Testing findMountPointByDevice finds all %d mount points", numMountPoints)
+	foundMountPoints, err := findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed: %v", err)
+	}
+
+	if len(foundMountPoints) != numMountPoints {
+		t.Fatalf("Expected %d mount points, but found %d. Found: %v", numMountPoints, len(foundMountPoints), foundMountPoints)
+	}
+
+	// Step 7: Verify all expected mount points are found
+	t.Logf("Step 7: Verifying all expected mount points are found")
+	foundMap := make(map[string]bool)
+	for _, mp := range foundMountPoints {
+		foundMap[mp] = true
+		t.Logf("  Found mount point: %s", mp)
+	}
+
+	for _, expectedMP := range expectedMountPoints {
+		if !foundMap[expectedMP] {
+			t.Errorf("Expected mount point %s not found in results", expectedMP)
+		}
+	}
+
+	// Step 8: Verify no unexpected mount points
+	if len(foundMountPoints) != len(expectedMountPoints) {
+		t.Errorf("Number of found mount points (%d) doesn't match expected (%d)", len(foundMountPoints), len(expectedMountPoints))
+	}
+
+	t.Logf("Test passed: findMountPointByDevice correctly found all %d mount points", numMountPoints)
+}
+
+// TestCleanupUnmountAllMountPoints tests that the cleanup logic can unmount all mount points
+// for a device that is mounted to multiple directories
+func TestCleanupUnmountAllMountPoints(t *testing.T) {
+	ctx := context.Background()
+
+	// Create a minimal Snapshotter instance for testing
+	snapshotter := &Snapshotter{
+		lvmVgName:    testVGName,
+		ThinPoolName: testPoolName,
+	}
+
+	// Generate a unique LV name for this test
+	lvName := fmt.Sprintf("test-cleanup-unmount-%d", os.Getpid())
+
+	// Create the test volume
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "100M",
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Clean up LV at the end
+	defer func() {
+		if err := lvm.ForceDestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to clean up test LV %s: %v", lvName, err)
+		}
+	}()
+
+	// Step 1: Create the LV
+	t.Logf("Step 1: Creating LV %s", lvName)
+	if err := lvm.CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create test volume: %v", err)
+	}
+
+	// Verify LV exists
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+	if _, err := os.Stat(devicePath); os.IsNotExist(err) {
+		t.Fatalf("LVM logical volume %s does not exist: %v", devicePath, err)
+	}
+
+	// Step 2: Format the filesystem
+	t.Logf("Step 2: Formatting filesystem on %s", devicePath)
+	cmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to create filesystem on %s: %v, output: %s", devicePath, err, string(output))
+	}
+
+	// Step 3: Create temporary directory for mount points
+	tmpRoot, err := os.MkdirTemp("", "devbox-test-cleanup-")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	// Step 4: Create 5 mount point directories and mount the LV to all of them
+	numMountPoints := 5
+	mountPoints := make([]string, numMountPoints)
+	for i := 0; i < numMountPoints; i++ {
+		mountPoint := filepath.Join(tmpRoot, fmt.Sprintf("mount-point-%d", i))
+		if err := os.MkdirAll(mountPoint, 0755); err != nil {
+			t.Fatalf("Failed to create mount point directory %s: %v", mountPoint, err)
+		}
+		mountPoints[i] = mountPoint
+
+		t.Logf("  Mounting %s to %s", devicePath, mountPoint)
+		if err := syscall.Mount(devicePath, mountPoint, "ext4", 0, ""); err != nil {
+			t.Fatalf("Failed to mount %s to %s: %v", devicePath, mountPoint, err)
+		}
+	}
+
+	// Ensure all mounts are unmounted at the end (in case test fails)
+	defer func() {
+		for _, mountPoint := range mountPoints {
+			if err := syscall.Unmount(mountPoint, 0); err != nil {
+				t.Logf("Warning: Failed to unmount %s during cleanup: %v", mountPoint, err)
+			}
+		}
+	}()
+
+	// Step 5: Verify all mount points are mounted
+	t.Logf("Step 5: Verifying all %d mount points are mounted", numMountPoints)
+	foundMountPoints, err := findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed: %v", err)
+	}
+	if len(foundMountPoints) != numMountPoints {
+		t.Fatalf("Expected %d mount points, but found %d", numMountPoints, len(foundMountPoints))
+	}
+	t.Logf("Confirmed all %d mount points are mounted", numMountPoints)
+
+	// Step 6: Test the cleanup logic - unmount all mount points
+	t.Logf("Step 6: Testing cleanup logic to unmount all mount points")
+	removedLvNames := []string{lvName}
+
+	// Simulate the cleanup logic from cleanupDirectories
+	for _, lvNameToCleanup := range removedLvNames {
+		devicePathToCheck := fmt.Sprintf("/dev/%s/%s", snapshotter.lvmVgName, lvNameToCleanup)
+		mountPointsToUnmount, err := findMountPointByDevice(devicePathToCheck)
+		if err != nil {
+			t.Fatalf("Failed to find mount points for LV %s: %v", lvNameToCleanup, err)
+		}
+
+		t.Logf("Found %d mount points to unmount for LV %s", len(mountPointsToUnmount), lvNameToCleanup)
+
+		unmountedCount := 0
+		for _, mountPoint := range mountPointsToUnmount {
+			t.Logf("  Attempting to unmount %s", mountPoint)
+			if err := snapshotter.unmountLvm(ctx, mountPoint); err != nil {
+				t.Errorf("Failed to unmount %s: %v", mountPoint, err)
+			} else {
+				unmountedCount++
+				t.Logf("  Successfully unmounted %s", mountPoint)
+			}
+		}
+
+		if unmountedCount != numMountPoints {
+			t.Errorf("Expected to unmount %d mount points, but only unmounted %d", numMountPoints, unmountedCount)
+		}
+	}
+
+	// Step 7: Verify all mount points are unmounted
+	t.Logf("Step 7: Verifying all mount points are unmounted")
+	foundMountPoints, err = findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed after unmount: %v", err)
+	}
+	if len(foundMountPoints) != 0 {
+		t.Errorf("Expected 0 mount points after cleanup, but found %d: %v", len(foundMountPoints), foundMountPoints)
+	} else {
+		t.Logf("Successfully verified all mount points are unmounted")
+	}
+
+	// Step 8: Verify device can be removed (no mount points should allow removal)
+	t.Logf("Step 8: Verifying device has no mount points (can be removed)")
+	remainingMountPoints, err := findMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("findMountPointByDevice failed: %v", err)
+	}
+	if len(remainingMountPoints) > 0 {
+		t.Errorf("Device still has %d mount points, cannot be safely removed: %v", len(remainingMountPoints), remainingMountPoints)
+	} else {
+		t.Logf("Device has no mount points, can be safely removed")
+	}
+
+	t.Logf("Test passed: cleanup logic successfully unmounted all %d mount points", numMountPoints)
 }

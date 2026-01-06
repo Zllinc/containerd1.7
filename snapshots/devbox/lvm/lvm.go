@@ -498,17 +498,18 @@ func UnmountVolume(mountPath string) error {
 	return nil
 }
 
-// FindMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
-// Returns the mount point path if found, empty string if not mounted, and error on failure
-func FindMountPointByDevice(devicePath string) (string, error) {
+// FindMountPointByDevice finds all mount points for a given device path by reading /proc/mounts
+// Returns a slice of mount point paths if found, empty slice if not mounted, and error on failure
+func FindMountPointByDevice(devicePath string) ([]string, error) {
 	lvmLock.Lock()
 	defer lvmLock.Unlock()
 
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return "", fmt.Errorf("failed to read /proc/mounts: %w", err)
+		return nil, fmt.Errorf("failed to read /proc/mounts: %w", err)
 	}
 
+	var mountPoints []string
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		if len(line) == 0 {
@@ -526,7 +527,8 @@ func FindMountPointByDevice(devicePath string) (string, error) {
 
 		// Check if the device matches (handle both direct path and symlink resolution)
 		if mountDevice == devicePath {
-			return mountPoint, nil
+			mountPoints = append(mountPoints, mountPoint)
+			continue
 		}
 
 		// Resolve both paths and compare
@@ -536,20 +538,23 @@ func FindMountPointByDevice(devicePath string) (string, error) {
 		// If both resolve successfully, compare resolved paths
 		if err1 == nil && err2 == nil {
 			if resolvedDevicePath == resolvedMountDevice {
-				return mountPoint, nil
+				mountPoints = append(mountPoints, mountPoint)
+				continue
 			}
 		}
 
 		// Also check if one resolves to the other
 		if err1 == nil && resolvedDevicePath == mountDevice {
-			return mountPoint, nil
+			mountPoints = append(mountPoints, mountPoint)
+			continue
 		}
 		if err2 == nil && resolvedMountDevice == devicePath {
-			return mountPoint, nil
+			mountPoints = append(mountPoints, mountPoint)
+			continue
 		}
 	}
 
-	return "", nil
+	return mountPoints, nil
 }
 
 // isMountPoint checks if a directory is a mount point

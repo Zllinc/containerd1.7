@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -866,5 +867,165 @@ func TestIsMountPoint_PerformanceComparison(t *testing.T) {
 		} else {
 			t.Logf("Path %s: both methods agree - mounted: %v", path, result1)
 		}
+	}
+}
+
+// TestFindMountPointByDevice_MultipleMountPoints tests that FindMountPointByDevice can find all mount points
+func TestFindMountPointByDevice_MultipleMountPoints(t *testing.T) {
+	ctx := context.Background()
+
+	// Create test LV
+	lvName := "test-find-mount-multiple"
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "104857600", // 100M in bytes
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Create LV
+	if err := CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create LV: %v", err)
+	}
+
+	// Ensure cleanup
+	defer func() {
+		if err := DestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to cleanup LV %s: %v", lvName, err)
+		}
+	}()
+
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+
+	// Format the device
+	mkfsCmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	if output, err := mkfsCmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to format device: %v, output: %s", err, output)
+	}
+
+	// Create multiple mount points
+	mountPaths := []string{
+		"/tmp/test-mount-1",
+		"/tmp/test-mount-2",
+		"/tmp/test-mount-3",
+	}
+
+	// Cleanup function for mount points
+	cleanupMounts := func() {
+		for _, mountPath := range mountPaths {
+			// Unmount
+			_ = UnmountVolume(mountPath)
+			// Remove directory
+			_ = os.RemoveAll(mountPath)
+		}
+	}
+	defer cleanupMounts()
+
+	// Mount the device to multiple locations
+	for _, mountPath := range mountPaths {
+		if err := os.MkdirAll(mountPath, 0755); err != nil {
+			t.Fatalf("Failed to create mount directory %s: %v", mountPath, err)
+		}
+
+		if err := MountVolume(devicePath, mountPath, "ext4", 0, ""); err != nil {
+			t.Fatalf("Failed to mount %s to %s: %v", devicePath, mountPath, err)
+		}
+		t.Logf("Successfully mounted %s to %s", devicePath, mountPath)
+	}
+
+	// Test FindMountPointByDevice
+	foundMountPoints, err := FindMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("FindMountPointByDevice failed: %v", err)
+	}
+
+	t.Logf("Found %d mount points: %v", len(foundMountPoints), foundMountPoints)
+
+	// Verify all mount points were found
+	if len(foundMountPoints) != len(mountPaths) {
+		t.Errorf("Expected to find %d mount points, but found %d: %v", len(mountPaths), len(foundMountPoints), foundMountPoints)
+	}
+
+	// Check that all expected mount points are in the result
+	foundMap := make(map[string]bool)
+	for _, mp := range foundMountPoints {
+		foundMap[mp] = true
+	}
+
+	for _, expectedPath := range mountPaths {
+		if !foundMap[expectedPath] {
+			t.Errorf("Expected mount point %s not found in results", expectedPath)
+		}
+	}
+
+	// Test with symlink path
+	symlinkPath, err := filepath.EvalSymlinks(devicePath)
+	if err != nil {
+		t.Logf("Warning: Failed to resolve symlink for %s: %v", devicePath, err)
+	} else if symlinkPath != devicePath {
+		t.Logf("Testing with symlink path: %s", symlinkPath)
+		foundMountPoints2, err := FindMountPointByDevice(symlinkPath)
+		if err != nil {
+			t.Fatalf("FindMountPointByDevice with symlink failed: %v", err)
+		}
+
+		if len(foundMountPoints2) != len(mountPaths) {
+			t.Errorf("Expected to find %d mount points with symlink, but found %d: %v", len(mountPaths), len(foundMountPoints2), foundMountPoints2)
+		}
+	}
+}
+
+// TestFindMountPointByDevice_NoMountPoints tests FindMountPointByDevice with unmounted device
+func TestFindMountPointByDevice_NoMountPoints(t *testing.T) {
+	ctx := context.Background()
+
+	// Create test LV
+	lvName := "test-find-mount-none"
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      "104857600", // 100M in bytes
+			VolGroup:      testVGName,
+			ThinProvision: testPoolName,
+		},
+	}
+
+	// Create LV
+	if err := CreateVolume(ctx, vol); err != nil {
+		t.Fatalf("Failed to create LV: %v", err)
+	}
+
+	// Ensure cleanup
+	defer func() {
+		if err := DestroyVolume(ctx, vol); err != nil {
+			t.Logf("Warning: Failed to cleanup LV %s: %v", lvName, err)
+		}
+	}()
+
+	devicePath := fmt.Sprintf("/dev/%s/%s", testVGName, lvName)
+
+	// Format the device
+	mkfsCmd := exec.Command("mkfs.ext4", "-F", devicePath)
+	if output, err := mkfsCmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to format device: %v, output: %s", err, output)
+	}
+
+	// Test FindMountPointByDevice on unmounted device
+	foundMountPoints, err := FindMountPointByDevice(devicePath)
+	if err != nil {
+		t.Fatalf("FindMountPointByDevice failed: %v", err)
+	}
+
+	t.Logf("Found %d mount points for unmounted device: %v", len(foundMountPoints), foundMountPoints)
+
+	// Should return empty slice for unmounted device
+	if len(foundMountPoints) != 0 {
+		t.Errorf("Expected 0 mount points for unmounted device, but found %d: %v", len(foundMountPoints), foundMountPoints)
 	}
 }

@@ -511,7 +511,7 @@ func (o *Snapshotter) cleanupDirectories(ctx context.Context) (_ []string, _ []s
 		// Unmount any mounted LVs
 		for _, lvName := range removedLvNames {
 			devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
-			mountPoints, err := findMountPointByDevice(devicePath)
+			mountPoints, err := lvm.FindMountPointByDevice(devicePath)
 			if err != nil {
 				log.G(ctx).WithError(err).WithField("lvName", lvName).WithField("devicePath", devicePath).
 					Warn("Cleanup: failed to find mount point for LV, continuing")
@@ -637,55 +637,6 @@ func readProcMounts() ([][]string, error) {
 	}
 
 	return mounts, nil
-}
-
-// findMountPointByDevice finds the mount point for a given device path by reading /proc/mounts
-// Returns the mount point path if found, empty string if not mounted, and error on failure
-func findMountPointByDevice(devicePath string) ([]string, error) {
-	mounts, err := readProcMounts()
-	if err != nil {
-		return nil, err
-	}
-
-	var mountPoints []string
-	for _, fields := range mounts {
-		if len(fields) < 2 {
-			continue
-		}
-
-		mountDevice := fields[0]
-		mountPoint := fields[1]
-
-		// Check if the device matches (handle both direct path and symlink resolution)
-		if mountDevice == devicePath {
-			mountPoints = append(mountPoints, mountPoint)
-			continue
-		}
-
-		// Resolve both paths and compare
-		resolvedDevicePath, err1 := filepath.EvalSymlinks(devicePath)
-		resolvedMountDevice, err2 := filepath.EvalSymlinks(mountDevice)
-
-		// If both resolve successfully, compare resolved paths
-		if err1 == nil && err2 == nil {
-			if resolvedDevicePath == resolvedMountDevice {
-				mountPoints = append(mountPoints, mountPoint)
-				continue
-			}
-		}
-
-		// Also check if one resolves to the other
-		if err1 == nil && resolvedDevicePath == mountDevice {
-			mountPoints = append(mountPoints, mountPoint)
-			continue
-		}
-		if err2 == nil && resolvedMountDevice == devicePath {
-			mountPoints = append(mountPoints, mountPoint)
-			continue
-		}
-	}
-
-	return mountPoints, nil
 }
 
 func isMountPoint(dir string) (bool, error) {
@@ -1050,45 +1001,23 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 	log.G(ctx).Debug("Creating LVM volume:", lvName, "with capacity:", capacity, "in volume group:", o.lvmVgName)
 	err = lvm.CreateVolume(ctx, vol)
 	if err != nil {
-		// If create fails, we should remove the LVM logical volume
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after create failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create LVM logical volume %s: %w", lvName, err)
 	}
 
 	if err = o.mkfs(lvName); err != nil {
-		// If mkfs fails, we should remove the LVM logical volume
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after mkfs failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create filesystem on LVM logical volume %s: %w", lvName, err)
 	}
 
 	mounted = true
 	if err = o.mountLvm(ctx, lvName, td); err != nil {
-		// If mount fails, we should remove the LVM logical volume
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after mount failure")
-		}
 		return td, lvName, fmt.Errorf("failed to mount LVM logical volume %s: %w", lvName, err)
 	}
 
 	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
-		// If fs dir creation fails, we should unmount the LVM logical volume and force destroy it
-		o.unmountLvm(ctx, td)
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after fs dir creation failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create fs directory: %w", err)
 	}
 
 	if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
-		// If work dir creation fails, we should unmount the LVM logical volume and force destroy it
-		o.unmountLvm(ctx, td)
-		if err1 := o.forceRemoveLv(ctx, lvName); err1 != nil {
-			log.G(ctx).WithError(err1).WithField("lvName", lvName).Warn("failed to force destroy LVM logical volume after work dir creation failure")
-		}
 		return td, lvName, fmt.Errorf("failed to create work directory: %w", err)
 	}
 

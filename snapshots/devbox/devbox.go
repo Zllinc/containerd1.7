@@ -1044,13 +1044,12 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 		},
 	}
 
-	// Track LV creation and mount status for cleanup
-	lvCreated := false
+	// Track mount status for cleanup
 	mounted := false
 
 	// Defer cleanup: unmount and force remove LV if any step fails
 	defer func() {
-		if err != nil && lvCreated {
+		if err != nil {
 			if mounted {
 				// Unmount first if mounted
 				if unmountErr := o.unmountLvm(ctx, td); unmountErr != nil {
@@ -1069,16 +1068,15 @@ func (o *Snapshotter) prepareLvmDirectory(ctx context.Context, snapshotDir strin
 	if err != nil {
 		return td, lvName, fmt.Errorf("failed to create LVM logical volume %s: %w", lvName, err)
 	}
-	lvCreated = true
 
 	if err = o.mkfs(lvName); err != nil {
 		return td, lvName, fmt.Errorf("failed to create filesystem on LVM logical volume %s: %w", lvName, err)
 	}
 
+	mounted = true
 	if err = o.mountLvm(ctx, lvName, td); err != nil {
 		return td, lvName, fmt.Errorf("failed to mount LVM logical volume %s: %w", lvName, err)
 	}
-	mounted = true
 
 	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
 		return td, lvName, fmt.Errorf("failed to create fs directory: %w", err)

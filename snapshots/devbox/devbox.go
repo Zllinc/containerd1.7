@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	cp "github.com/otiai10/copy"
 
@@ -130,14 +131,15 @@ func WithMetaStore(ms MetaStore) Opt {
 }
 
 type Snapshotter struct {
-	root          string
-	ms            MetaStore
-	asyncRemove   bool
-	upperdirLabel bool
-	lvmVgName     string // modified by sealos
-	ThinPoolName  string
-	UseThinPool   bool
-	options       []string
+	root            string
+	ms              MetaStore
+	lvMetadataStore *storage.LVMetadataStore // LV 元数据存储（新增）
+	asyncRemove     bool
+	upperdirLabel   bool
+	lvmVgName       string // modified by sealos
+	ThinPoolName    string
+	UseThinPool     bool
+	options         []string
 }
 
 // NewSnapshotter returns a Snapshotter which uses overlayfs. The overlayfs
@@ -168,6 +170,12 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		}
 	}
 
+	// 初始化 LV 元数据存储（新增）
+	lvMetadataStore, err := storage.NewLVMetadataStore(filepath.Join(root, "devbox.db"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create LV metadata store: %w", err)
+	}
+
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
@@ -188,13 +196,14 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 	}
 
 	return &Snapshotter{
-		root:          root,
-		ms:            config.ms,
-		asyncRemove:   config.AsyncRemove,
-		upperdirLabel: config.UpperdirLabel,
-		lvmVgName:     config.lvmVgName, // modified by sealos
-		ThinPoolName:  config.ThinPoolName,
-		options:       config.mountOptions,
+		root:            root,
+		ms:              config.ms,
+		lvMetadataStore: lvMetadataStore, // LV 元数据存储（新增）
+		asyncRemove:     config.AsyncRemove,
+		upperdirLabel:   config.UpperdirLabel,
+		lvmVgName:       config.lvmVgName, // modified by sealos
+		ThinPoolName:    config.ThinPoolName,
+		options:         config.mountOptions,
 	}, nil
 }
 
@@ -300,9 +309,58 @@ func (o *Snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 	return usage, nil
 }
 
+// Prepare double db and state machine
 func (o *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	log.G(ctx).Debug("Prepare called with key:", key, "parent:", parent, "opts:", opts)
-	return o.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	log.G(ctx).Infof("Prepare: key=%s, parent=%s", key, parent)
+
+	// parse labels, check if it is devbox
+	base := snapshots.Info{}
+	for _, opt := range opts {
+		if err := opt(&base); err != nil {
+			return nil, fmt.Errorf("failed to apply snapshot option: %w", err)
+		}
+	}
+
+	contentID := base.Labels[devboxContentIDKey]
+	capacity := base.Labels[newLayerLimitKey]
+
+	// if it is not devbox, use the original logic
+	if contentID == "" || capacity == "" {
+		return o.createSnapshot(ctx, snapshots.KindActive, key, parent, opts)
+	}
+
+	// devbox snapshot
+	lvName := "devbox-" + contentID
+
+	// check LV state from devbox.db
+	currentState, lvInfo, err := o.getLVState(ctx, lvName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get LV state: %w", err)
+	}
+
+	log.G(ctx).Infof("Prepare: LV %s current state: %s", lvName, currentState)
+
+	// create snapshot based on LV state
+	switch currentState {
+	case storage.LVStateNone:
+		// first container: create LV
+		return o.prepareFirstContainer(ctx, key, parent, contentID, capacity, opts)
+
+	case storage.LVStateCreated:
+		// subsequent container: LV already exists, mount directly
+		return o.prepareSubsequentContainer(ctx, key, parent, contentID, lvInfo, opts)
+
+	case storage.LVStateMounting:
+		// last mount was interrupted, resume
+		return o.prepareFromMounting(ctx, key, lvInfo, opts)
+
+	case storage.LVStateMounted:
+		// mounted (repeated call or not cleaned up)
+		return o.prepareFromMounted(ctx, key, lvInfo, opts)
+
+	default:
+		return nil, fmt.Errorf("unexpected LV state: %s", currentState)
+	}
 }
 
 func (o *Snapshotter) View(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
@@ -1090,7 +1148,481 @@ func (o *Snapshotter) workPath(id string) string {
 
 // Close closes the snapshotter
 func (o *Snapshotter) Close() error {
+	if err := o.lvMetadataStore.Close(); err != nil {
+		log.L.WithError(err).Warn("failed to close LV metadata store")
+	}
 	return o.ms.Close()
+}
+
+// getLVState get LV state
+func (o *Snapshotter) getLVState(ctx context.Context, lvName string) (string, *storage.LVInfo, error) {
+	var lvInfo *storage.LVInfo
+	var err error
+
+	err = o.lvMetadataStore.WithTransaction(ctx, false, func(ctx context.Context) error {
+		lvInfo, err = storage.GetLV(ctx, lvName)
+		if err != nil {
+			if errdefs.IsNotFound(err) {
+				return nil // LV does not exist
+			}
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		return "", nil, err
+	}
+
+	if lvInfo == nil {
+		return storage.LVStateNone, nil, nil
+	}
+
+	return lvInfo.State, lvInfo, nil
+}
+
+// prepareFirstContainer first container: create LV
+func (o *Snapshotter) prepareFirstContainer(ctx context.Context, key, parent, contentID, capacity string, opts []snapshots.Opt) ([]mount.Mount, error) {
+	lvName := "devbox-" + contentID
+
+	log.G(ctx).Info("Prepare: First container, creating LV from scratch")
+
+	// create snapshot in metadata.db transaction
+	var snapID string
+	var snap storage.Snapshot
+	err := o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		var err error
+		snap, err = storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...)
+		if err != nil {
+			return err
+		}
+		snapID = snap.ID
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create snapshot in metadata.db: %w", err)
+	}
+	log.G(ctx).Infof("Prepare: Created snapshot in metadata.db, snapID=%s", snapID)
+
+	// create LV record in devbox.db transaction, mark as creating
+	parsedCapacity, err := parseUseLimit(capacity)
+	if err != nil {
+		// rollback step 1
+		o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+			_, _, err := storage.Remove(ctx, key)
+			return err
+		})
+		return nil, fmt.Errorf("failed to parse capacity: %w", err)
+	}
+
+	err = o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		now := time.Now()
+		return storage.AddLV(ctx, &storage.LVInfo{
+			Name:        lvName,
+			ContentID:   contentID,
+			State:       storage.LVStateCreating,
+			PrevState:   storage.LVStateNone,
+			CurrentKey:  key,
+			Capacity:    parsedCapacity,
+			IsFormatted: false,
+			CreatedTime: now,
+			UpdatedTime: now,
+		})
+	})
+	if err != nil {
+		// rollback: delete snapshot (compensate transaction)
+		log.G(ctx).WithError(err).Error("Failed to create LV record, rolling back snapshot")
+		o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+			_, _, err := storage.Remove(ctx, key)
+			return err
+		})
+		return nil, fmt.Errorf("failed to create LV record in devbox.db: %w", err)
+	}
+	log.G(ctx).Info("Prepare: Created LV record in devbox.db, state=creating")
+
+	// create LV physically (outside of transaction)
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: lvName},
+		Spec:       apis.VolumeInfo{Capacity: parsedCapacity, VolGroup: o.lvmVgName, ThinProvision: o.ThinPoolName},
+	}
+
+	createErr := lvm.CreateVolume(ctx, vol)
+	if createErr != nil {
+		log.G(ctx).WithError(createErr).Error("Failed to create LV")
+
+		// rollback: delete two database records
+		// 1. delete devbox.db record
+		o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+			return storage.RemoveLV(ctx, lvName)
+		})
+
+		// 2. delete metadata.db record
+		o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+			_, _, err := storage.Remove(ctx, key)
+			return err
+		})
+
+		// 3. try to clean up possible zombie LV
+		err = lvm.ForceDestroyVolume(ctx, vol)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Failed to force destroy LV")
+		}
+		return nil, fmt.Errorf("failed to create LV: %w", createErr)
+	}
+	log.G(ctx).Info("Prepare: LV created successfully")
+
+	// mark as created in devbox.db transaction
+	err = o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+			lv.State = storage.LVStateCreated
+			lv.UpdatedTime = time.Now()
+		})
+	})
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to update LV state to created")
+
+		// rollback: delete two database records
+		// 1. delete devbox.db record
+		o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+			return storage.RemoveLV(ctx, lvName)
+		})
+
+		// 2. delete metadata.db record
+		o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+			_, _, err := storage.Remove(ctx, key)
+			return err
+		})
+
+		// 3. try to clean up possible zombie LV
+		err = lvm.ForceDestroyVolume(ctx, vol)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).Warn("Failed to force destroy LV")
+		}
+		return nil, fmt.Errorf("failed to create LV: %w", createErr)
+	}
+
+	// format and mount
+	mounts, err := o.formatAndMountLV(ctx, key, lvName, snapID, true, parent, opts)
+	// if err != nil {
+	// 	log.G(ctx).WithError(err).Error("Failed to format and mount LV, rolling back both databases")
+
+	// 	// rollback devbox.db: delete LV record
+	// 	o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+	// 		return storage.RemoveLV(ctx, lvName)
+	// 	})
+
+	// 	// rollback metadata.db: delete snapshot record
+	// 	o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+	// 		_, _, err := storage.Remove(ctx, key)
+	// 		return err
+	// 	})
+
+	// 	// try to clean up physical LV if it exists
+	// 	vol := &apis.LVMVolume{
+	// 		ObjectMeta: metav1.ObjectMeta{Name: lvName},
+	// 		Spec:       apis.VolumeInfo{VolGroup: o.lvmVgName},
+	// 	}
+	// 	if removeErr := lvm.ForceDestroyVolume(ctx, vol); removeErr != nil {
+	// 		log.G(ctx).WithError(removeErr).WithField("lvName", lvName).Warn("Failed to force destroy LV during rollback")
+	// 	}
+
+	// 	return nil, fmt.Errorf("failed to format and mount LV: %w", err)
+	// }
+
+	return mounts, nil
+}
+
+// prepareSubsequentContainer subsequent container: LV already exists
+func (o *Snapshotter) prepareSubsequentContainer(ctx context.Context, key, parent, contentID string, lvInfo *storage.LVInfo, opts []snapshots.Opt) ([]mount.Mount, error) {
+	lvName := lvInfo.Name
+
+	log.G(ctx).Infof("Prepare: Subsequent container, LV already exists")
+
+	// create snapshot in metadata.db transaction
+	var snapID string
+	var snap storage.Snapshot
+
+	// try to get snapshot (handle interrupted recovery)
+	err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		snap, err = storage.GetSnapshot(ctx, key)
+		if err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
+		if err == nil {
+			snapID = snap.ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get snapshot: %w", err)
+	}
+
+	// if not found, create it
+	if snapID == "" {
+		log.G(ctx).Info("Prepare: Snapshot not found, creating (resuming from interrupted operation)")
+		err = o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+			var err error
+			snap, err = storage.CreateSnapshot(ctx, snapshots.KindActive, key, parent, opts...)
+			if err != nil {
+				return err
+			}
+			snapID = snap.ID
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create snapshot: %w", err)
+		}
+	}
+
+	// update LV record in devbox.db transaction
+	err = o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+			lv.CurrentKey = key
+			lv.UpdatedTime = time.Now()
+		})
+	})
+	if err != nil {
+		// rollback: delete snapshot
+		log.G(ctx).WithError(err).Error("Failed to update LV record")
+		return nil, fmt.Errorf("failed to update LV record: %w", err)
+	}
+
+	return o.formatAndMountLV(ctx, key, lvName, snapID, true, parent, opts)
+}
+
+// formatAndMountLV format and mount LV
+// Note: Any failure will be handled by the caller (full rollback of both DBs and physical LV)
+func (o *Snapshotter) formatAndMountLV(ctx context.Context, key, lvName, snapID string, needFormat bool, parent string, opts []snapshots.Opt) ([]mount.Mount, error) {
+	snapshotDir := filepath.Join(o.root, "snapshots")
+	tempDir := filepath.Join(snapshotDir, "temp-"+snapID)
+	finalDir := filepath.Join(snapshotDir, snapID)
+
+	// mark as mounting in devbox.db transaction
+	err := o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+			lv.PrevState = lv.State
+			lv.State = storage.LVStateMounting
+			lv.MountPoint = tempDir
+			lv.UpdatedTime = time.Now()
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to mark as mounting: %w", err)
+	}
+	log.G(ctx).Info("Prepare: Marked LV as mounting")
+
+	// create temporary mount directory
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+
+	// format LV if needed
+	if needFormat {
+		log.G(ctx).Info("Prepare: Formatting LV (first container)")
+		if err := o.mkfs(lvName); err != nil {
+			log.G(ctx).WithError(err).WithField("lvName", lvName).Error("Failed to format LV")
+			os.RemoveAll(tempDir)
+			return nil, fmt.Errorf("failed to format LV: %w", err)
+		}
+
+		// mark as formatted
+		if err := o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+			return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+				lv.IsFormatted = true
+			})
+		}); err != nil {
+			os.RemoveAll(tempDir)
+			return nil, fmt.Errorf("failed to update formatted flag: %w", err)
+		}
+	}
+
+	// mount to temporary directory
+	if err := o.mountLvm(ctx, lvName, tempDir); err != nil {
+		log.G(ctx).WithError(err).Error("Failed to mount LV to temp dir")
+		os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("failed to mount LV: %w", err)
+	}
+	log.G(ctx).Info("Prepare: LV mounted to temp dir")
+
+	// create overlayfs directories
+	fsDir := filepath.Join(tempDir, "fs")
+	workDir := filepath.Join(tempDir, "work")
+	if err := os.MkdirAll(fsDir, 0755); err != nil {
+		o.unmountLvm(ctx, tempDir)
+		os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("failed to create fs dir: %w", err)
+	}
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		o.unmountLvm(ctx, tempDir)
+		os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("failed to create work dir: %w", err)
+	}
+
+	// unmount from temp, rename, and remount to final directory
+	if err := o.unmountLvm(ctx, tempDir); err != nil {
+		log.G(ctx).WithError(err).Error("Failed to unmount from temp dir")
+		os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("failed to unmount: %w", err)
+	}
+
+	if err := os.Rename(tempDir, finalDir); err != nil {
+		os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("failed to rename: %w", err)
+	}
+
+	// mount to final directory
+	if err := o.mountLvm(ctx, lvName, finalDir); err != nil {
+		log.G(ctx).WithError(err).Error("Failed to mount to final dir")
+		os.RemoveAll(finalDir)
+		return nil, fmt.Errorf("failed to mount to final dir: %w", err)
+	}
+
+	// mark as mounted in devbox.db
+	err = o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+			lv.State = storage.LVStateMounted
+			lv.MountPoint = finalDir
+			lv.LastError = ""
+			lv.UpdatedTime = time.Now()
+		})
+	})
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to update LV state to mounted")
+		// Don't fail here - the mount succeeded, just the state update failed
+		o.unmountLvm(ctx, tempDir)
+		os.RemoveAll(tempDir)
+		return nil, fmt.Errorf("failed to update LV state to mounted: %w", err)
+	}
+
+	log.G(ctx).Infof("Prepare: Successfully mounted LV to %s", finalDir)
+
+	// get snapshot info and return mounts
+	var snap storage.Snapshot
+	o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		snap, err = storage.GetSnapshot(ctx, key)
+		return err
+	})
+
+	return o.mounts(snap), nil
+}
+
+// prepareFromMounting recover from mounting state (interrupted mount operation)
+func (o *Snapshotter) prepareFromMounting(ctx context.Context, key string, lvInfo *storage.LVInfo, opts []snapshots.Opt) ([]mount.Mount, error) {
+	lvName := lvInfo.Name
+
+	log.G(ctx).WithField("lvName", lvName).Warn("Prepare: Recovering from mounting state (operation was interrupted)")
+
+	// check if snapshot already exists in metadata.db
+	var snapID string
+	var snap storage.Snapshot
+	err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		var err error
+		snap, err = storage.GetSnapshot(ctx, key)
+		if err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
+		if err == nil {
+			snapID = snap.ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check snapshot: %w", err)
+	}
+
+	// if snapshot doesn't exist, we need to rollback and restart
+	if snapID == "" {
+		log.G(ctx).Warn("Prepare: Snapshot not found during mounting recovery, rolling back to created state")
+		o.rollbackLVState(ctx, lvName, storage.LVStateCreated, fmt.Errorf("snapshot not found"))
+		return nil, fmt.Errorf("snapshot not found, please retry")
+	}
+
+	// snapshot exists, continue with mount operation
+	// determine if formatting is needed
+	needFormat := !lvInfo.IsFormatted
+
+	log.G(ctx).Infof("Prepare: Continuing mount operation for LV %s (needFormat=%v)", lvName, needFormat)
+
+	// continue with formatAndMountLV
+	// Note: formatAndMountLV will handle state updates internally
+	return o.formatAndMountLV(ctx, key, lvName, snapID, needFormat, "", opts)
+}
+
+// prepareFromMounted handle already mounted state (repeated call or not cleaned up)
+func (o *Snapshotter) prepareFromMounted(ctx context.Context, key string, lvInfo *storage.LVInfo, opts []snapshots.Opt) ([]mount.Mount, error) {
+	lvName := lvInfo.Name
+
+	log.G(ctx).WithFields(logrus.Fields{
+		"lvName":     lvName,
+		"currentKey": lvInfo.CurrentKey,
+		"requestKey": key,
+	}).Warn("Prepare: LV already mounted")
+
+	// check if this is the same container
+	if lvInfo.CurrentKey == key {
+		// same container, this is a repeated Prepare call
+		// just return the mounts
+		log.G(ctx).Info("Prepare: Same container, returning existing mounts")
+
+		var snap storage.Snapshot
+		err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+			var err error
+			snap, err = storage.GetSnapshot(ctx, key)
+			return err
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get snapshot: %w", err)
+		}
+
+		return o.mounts(snap), nil
+	}
+
+	// different container, this means the previous container didn't unmount
+	// we need to unmount first, then mount for the new container
+	log.G(ctx).Warn("Prepare: Different container, LV not properly unmounted from previous container")
+
+	// unmount the LV
+	if lvInfo.MountPoint != "" {
+		log.G(ctx).Infof("Prepare: Unmounting LV from %s", lvInfo.MountPoint)
+		if err := o.unmountLvm(ctx, lvInfo.MountPoint); err != nil {
+			log.G(ctx).WithError(err).Error("Failed to unmount LV")
+			return nil, fmt.Errorf("failed to unmount LV: %w", err)
+		}
+	}
+
+	// update state to created
+	err := o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+			lv.State = storage.LVStateCreated
+			lv.CurrentKey = ""
+			lv.MountPoint = ""
+			lv.UpdatedTime = time.Now()
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update LV state: %w", err)
+	}
+
+	// now prepare for the new container
+	return o.prepareSubsequentContainer(ctx, key, "", lvInfo.ContentID, lvInfo, opts)
+}
+
+// rollbackLVState rollback LV state
+func (o *Snapshotter) rollbackLVState(ctx context.Context, lvName, targetState string, lastError error) {
+	err := o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		return storage.UpdateLV(ctx, lvName, func(lv *storage.LVInfo) {
+			lv.State = targetState
+			if lastError != nil {
+				lv.LastError = lastError.Error()
+			}
+			lv.UpdatedTime = time.Now()
+		})
+	})
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to rollback LV state")
+	}
 }
 
 // supportsIndex checks whether the "index=off" option is supported by the kernel.

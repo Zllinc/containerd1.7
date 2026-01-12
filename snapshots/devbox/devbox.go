@@ -1303,31 +1303,31 @@ func (o *Snapshotter) prepareFirstContainer(ctx context.Context, key, parent, co
 
 	// format and mount
 	mounts, err := o.formatAndMountLV(ctx, key, lvName, snapID, true, parent, opts)
-	// if err != nil {
-	// 	log.G(ctx).WithError(err).Error("Failed to format and mount LV, rolling back both databases")
+	if err != nil {
+		log.G(ctx).WithError(err).Error("Failed to format and mount LV, rolling back both databases")
 
-	// 	// rollback devbox.db: delete LV record
-	// 	o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
-	// 		return storage.RemoveLV(ctx, lvName)
-	// 	})
+		// // rollback devbox.db: delete LV record
+		// o.lvMetadataStore.WithTransaction(ctx, true, func(ctx context.Context) error {
+		// 	return storage.RemoveLV(ctx, lvName)
+		// })
 
-	// 	// rollback metadata.db: delete snapshot record
-	// 	o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-	// 		_, _, err := storage.Remove(ctx, key)
-	// 		return err
-	// 	})
+		// // rollback metadata.db: delete snapshot record
+		// o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		// 	_, _, err := storage.Remove(ctx, key)
+		// 	return err
+		// })
 
-	// 	// try to clean up physical LV if it exists
-	// 	vol := &apis.LVMVolume{
-	// 		ObjectMeta: metav1.ObjectMeta{Name: lvName},
-	// 		Spec:       apis.VolumeInfo{VolGroup: o.lvmVgName},
-	// 	}
-	// 	if removeErr := lvm.ForceDestroyVolume(ctx, vol); removeErr != nil {
-	// 		log.G(ctx).WithError(removeErr).WithField("lvName", lvName).Warn("Failed to force destroy LV during rollback")
-	// 	}
+		// // try to clean up physical LV if it exists
+		// vol := &apis.LVMVolume{
+		// 	ObjectMeta: metav1.ObjectMeta{Name: lvName},
+		// 	Spec:       apis.VolumeInfo{VolGroup: o.lvmVgName},
+		// }
+		// if removeErr := lvm.ForceDestroyVolume(ctx, vol); removeErr != nil {
+		// 	log.G(ctx).WithError(removeErr).WithField("lvName", lvName).Warn("Failed to force destroy LV during rollback")
+		// }
 
-	// 	return nil, fmt.Errorf("failed to format and mount LV: %w", err)
-	// }
+		return nil, fmt.Errorf("failed to format and mount LV: %w", err)
+	}
 
 	return mounts, nil
 }
@@ -1414,6 +1414,8 @@ func (o *Snapshotter) formatAndMountLV(ctx context.Context, key, lvName, snapID 
 
 	// create temporary mount directory
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		log.G(ctx).WithError(err).Error("Failed to create temp dir")
+		os.RemoveAll(tempDir)
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
@@ -1532,12 +1534,12 @@ func (o *Snapshotter) prepareFromMounting(ctx context.Context, key string, lvInf
 		return nil, fmt.Errorf("failed to check snapshot: %w", err)
 	}
 
-	// if snapshot doesn't exist, we need to rollback and restart
-	if snapID == "" {
-		log.G(ctx).Warn("Prepare: Snapshot not found during mounting recovery, rolling back to created state")
-		o.rollbackLVState(ctx, lvName, storage.LVStateCreated, fmt.Errorf("snapshot not found"))
-		return nil, fmt.Errorf("snapshot not found, please retry")
-	}
+	// // if snapshot doesn't exist, we need to rollback and restart
+	// if snapID == "" {
+	// 	log.G(ctx).Warn("Prepare: Snapshot not found during mounting recovery, rolling back to created state")
+	// 	o.rollbackLVState(ctx, lvName, storage.LVStateCreated, fmt.Errorf("snapshot not found"))
+	// 	return nil, fmt.Errorf("snapshot not found, please retry")
+	// }
 
 	// snapshot exists, continue with mount operation
 	// determine if formatting is needed

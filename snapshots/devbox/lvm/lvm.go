@@ -36,8 +36,28 @@ import (
 	apis "github.com/openebs/lvm-localpv/pkg/apis/openebs.io/lvm/v1alpha1"
 )
 
-// lvmLock lvm global lock
-var lvmLock sync.Mutex
+// lvmLock lvm global read-write lock
+var lvmLock sync.RWMutex
+
+// LockLV acquires the global LVM lock for write operations
+func LockLV() {
+	lvmLock.Lock()
+}
+
+// UnlockLV releases the global LVM lock for write operations
+func UnlockLV() {
+	lvmLock.Unlock()
+}
+
+// RLockLV acquires the global LVM lock for read operations
+func RLockLV() {
+	lvmLock.RLock()
+}
+
+// RUnlockLV releases the global LVM lock for read operations
+func RUnlockLV() {
+	lvmLock.RUnlock()
+}
 
 // lvm related constants
 const (
@@ -473,12 +493,11 @@ func MountVolume(devicePath, mountPath, fsType string, flags uintptr, options st
 // This function is protected by the global LVM lock to prevent concurrent operations
 // It uses the same lock as LVM operations because unmount often happens alongside
 // LVM operations (resize, remove) and they may conflict on the same device
-func UnmountVolume(mountPath string) error {
-	lvmLock.Lock()
-	defer lvmLock.Unlock()
-
+// UnmountVolumeInternal performs the actual unmount operation without acquiring locks.
+// The caller must hold the appropriate lock before calling this function.
+func UnmountVolumeInternal(mountPath string) error {
 	// check if the path is a mount point
-	isMounted, err := IsMountPoint(mountPath)
+	isMounted, err := IsMountPointInternal(mountPath)
 	if err != nil {
 		return fmt.Errorf("failed to check if %s is a mount point: %w", mountPath, err)
 	}
@@ -498,11 +517,46 @@ func UnmountVolume(mountPath string) error {
 	return nil
 }
 
+// IsMountPointInternal checks if a directory is a mount point without acquiring locks.
+// The caller must hold the appropriate lock before calling this function.
+func IsMountPointInternal(dir string) (bool, error) {
+	// check if the directory exists
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return false, nil
+	}
+
+	// get directory information
+	dirStat, err := os.Stat(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat %s: %w", dir, err)
+	}
+
+	// get parent directory information
+	parentDir := filepath.Dir(dir)
+	parentStat, err := os.Stat(parentDir)
+	if err != nil {
+		return false, fmt.Errorf("failed to stat parent %s: %w", parentDir, err)
+	}
+
+	// if the directory and parent directory have different device numbers, it is a mount point
+	dirDev := dirStat.Sys().(*syscall.Stat_t).Dev
+	parentDev := parentStat.Sys().(*syscall.Stat_t).Dev
+
+	return dirDev != parentDev, nil
+}
+
+func UnmountVolume(mountPath string) error {
+	lvmLock.Lock()
+	defer lvmLock.Unlock()
+
+	return UnmountVolumeInternal(mountPath)
+}
+
 // FindMountPointByDevice finds all mount points for a given device path by reading /proc/mounts
 // Returns a slice of mount point paths if found, empty slice if not mounted, and error on failure
 func FindMountPointByDevice(devicePath string) ([]string, error) {
-	lvmLock.Lock()
-	defer lvmLock.Unlock()
+	lvmLock.RLock()
+	defer lvmLock.RUnlock()
 
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
@@ -559,29 +613,10 @@ func FindMountPointByDevice(devicePath string) ([]string, error) {
 
 // isMountPoint checks if a directory is a mount point
 func IsMountPoint(dir string) (bool, error) {
-	// check if the directory exists
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return false, nil
-	}
+	lvmLock.RLock()
+	defer lvmLock.RUnlock()
 
-	// get directory information
-	dirStat, err := os.Stat(dir)
-	if err != nil {
-		return false, fmt.Errorf("failed to stat %s: %w", dir, err)
-	}
-
-	// get parent directory information
-	parentDir := filepath.Dir(dir)
-	parentStat, err := os.Stat(parentDir)
-	if err != nil {
-		return false, fmt.Errorf("failed to stat parent %s: %w", parentDir, err)
-	}
-
-	// if the directory and parent directory have different device numbers, it is a mount point
-	dirDev := dirStat.Sys().(*syscall.Stat_t).Dev
-	parentDev := parentStat.Sys().(*syscall.Stat_t).Dev
-
-	return dirDev != parentDev, nil
+	return IsMountPointInternal(dir)
 }
 
 // CheckLVMMetadataExists checks if the lvm volume exists in metadata
@@ -1170,8 +1205,8 @@ func ListLVMLogicalVolume(ctx context.Context) ([]LogicalVolume, error) {
 
 // modified by sealos
 func ListLVMLogicalVolumeByVG(ctx context.Context, vg string, pool string) ([]LogicalVolume, error) {
-	lvmLock.Lock()
-	defer lvmLock.Unlock()
+	lvmLock.RLock()
+	defer lvmLock.RUnlock()
 
 	if err := ReloadLVMMetadataCache(ctx); err != nil {
 		return nil, err

@@ -366,13 +366,17 @@ func (o *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 }
 
 func (o *Snapshotter) RemoveDir(ctx context.Context, dir string) {
-	isMounted, err := lvm.IsMountPoint(dir)
+	// Hold lock to ensure atomicity between check and use (prevent TOCTOU race condition)
+	lvm.LockLV()
+	defer lvm.UnlockLV()
+
+	isMounted, err := lvm.IsMountPointInternal(dir)
 	if err != nil {
 		log.G(ctx).WithError(err).WithField("path", dir).Warn("failed to check if path is a mount point")
 		return
 	}
 	if isMounted {
-		if err1 := o.unmountLvm(ctx, dir); err1 != nil {
+		if err1 := lvm.UnmountVolumeInternal(dir); err1 != nil {
 			log.G(ctx).WithError(err1).WithField("path", dir).Warn("failed to unmount directory")
 			return
 		}
@@ -395,6 +399,7 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 	var (
 		removals       []string
 		removedLvNames []string
+		mountPath      string
 	)
 
 	log.G(ctx).Infof("Remove called with key: %s", key)
@@ -402,6 +407,11 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 	// return error since the transaction is committed with the removal
 	// key no longer available.
 	defer func() {
+		if mountPath != "" {
+			if err = o.unmountLvm(ctx, mountPath); err != nil {
+				log.G(ctx).WithError(err).WithField("path", mountPath).Warn("failed to unmount directory")
+			}
+		}
 		if err == nil {
 			for _, dir := range removals {
 				o.RemoveDir(ctx, dir)
@@ -419,17 +429,12 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 
 	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		// modified by sealos
-		var mountPath string
 		mountPath, err = storage.RemoveDevbox(ctx, key)
 		log.G(ctx).Infof("Removed devbox content for key: %s, mount path: %s", key, mountPath)
 		if err != nil && err != errdefs.ErrNotFound {
 			return fmt.Errorf("failed to remove devbox content for snapshot %s: %w", key, err)
 		}
-		if mountPath != "" {
-			if err = o.unmountLvm(ctx, mountPath); err != nil {
-				log.G(ctx).WithError(err).WithField("path", mountPath).Warn("failed to unmount directory")
-			}
-		}
+
 		_, _, err = storage.Remove(ctx, key)
 		if err != nil {
 			return fmt.Errorf("failed to remove snapshot %s: %w", key, err)
@@ -640,6 +645,10 @@ func readProcMounts() ([][]string, error) {
 }
 
 func isMountPoint(dir string) (bool, error) {
+	// Acquire global LVM lock to protect reading /proc/mounts
+	lvm.RLockLV()
+	defer lvm.RUnlockLV()
+
 	mounts, err := readProcMounts()
 	if err != nil {
 		return false, err
@@ -657,6 +666,10 @@ func isMountPoint(dir string) (bool, error) {
 }
 
 func (o *Snapshotter) mkfs(lvName string) error {
+	// Acquire global LVM lock to protect filesystem operations
+	lvm.LockLV()
+	defer lvm.UnlockLV()
+
 	devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
 	// Check if the device exists
 	if _, err := os.Stat(devicePath); os.IsNotExist(err) {

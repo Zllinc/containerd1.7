@@ -397,7 +397,7 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 		removedLvNames []string
 	)
 
-	log.G(ctx).Infof("Remove called with key: %s", key)
+	log.G(ctx).Warnf("Remove called with key: %s", key)
 	// Remove directories after the transaction is closed, failures must not
 	// return error since the transaction is committed with the removal
 	// key no longer available.
@@ -421,7 +421,7 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 		// modified by sealos
 		var mountPath string
 		mountPath, err = storage.RemoveDevbox(ctx, key)
-		log.G(ctx).Infof("Removed devbox content for key: %s, mount path: %s", key, mountPath)
+		log.G(ctx).Warnf("Removed devbox content for key: %s, mount path: %s", key, mountPath)
 		if err != nil && err != errdefs.ErrNotFound {
 			return fmt.Errorf("failed to remove devbox content for snapshot %s: %w", key, err)
 		}

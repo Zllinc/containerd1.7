@@ -397,7 +397,10 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 		removedLvNames []string
 	)
 
-	log.G(ctx).Warnf("Remove called with key: %s", key)
+	log.G(ctx).WithFields(logrus.Fields{
+		"key":         key,
+		"snapshotter": "devbox",
+	}).Warnf("[DEVBOX-REMOVE-TRACE] ========== Remove function called ==========")
 	// Remove directories after the transaction is closed, failures must not
 	// return error since the transaction is committed with the removal
 	// key no longer available.
@@ -421,14 +424,24 @@ func (o *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 		// modified by sealos
 		var mountPath string
 		mountPath, err = storage.RemoveDevbox(ctx, key)
-		log.G(ctx).Warnf("Removed devbox content for key: %s, mount path: %s", key, mountPath)
+		log.G(ctx).WithFields(logrus.Fields{
+			"key":       key,
+			"mountPath": mountPath,
+			"error":     err,
+		}).Warnf("[DEVBOX-REMOVE-TRACE] RemoveDevbox returned")
 		if err != nil && err != errdefs.ErrNotFound {
 			return fmt.Errorf("failed to remove devbox content for snapshot %s: %w", key, err)
 		}
 		if mountPath != "" {
+			log.G(ctx).WithFields(logrus.Fields{
+				"key":       key,
+				"mountPath": mountPath,
+			}).Warnf("[DEVBOX-REMOVE-TRACE] mountPath is NOT empty, calling unmountLvm")
 			if err = o.unmountLvm(ctx, mountPath); err != nil {
 				log.G(ctx).WithError(err).WithField("path", mountPath).Warn("failed to unmount directory")
 			}
+		} else {
+			log.G(ctx).WithField("key", key).Warnf("[DEVBOX-REMOVE-TRACE] mountPath is EMPTY! unmountLvm will NOT be called")
 		}
 		_, _, err = storage.Remove(ctx, key)
 		if err != nil {

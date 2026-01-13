@@ -26,6 +26,7 @@ import (
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/filters"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/metadata/boltutil"
 	"github.com/containerd/containerd/snapshots"
 	bolt "go.etcd.io/bbolt"
@@ -861,6 +862,8 @@ func RemoveDevbox(ctx context.Context, Key string) (string, error) {
 	var (
 		mountPath string
 	)
+
+	log.G(ctx).WithField("key", Key).Warnf("[REMOVE-DEVBOX-TRACE] RemoveDevbox called with key")
 	if Key == "" {
 		return "", fmt.Errorf("content key cannot be empty")
 	}
@@ -871,10 +874,18 @@ func RemoveDevbox(ctx context.Context, Key string) (string, error) {
 		}
 		sbkt := bkt.Bucket([]byte(Key))
 		if sbkt == nil {
+			log.G(ctx).WithField("key", Key).Warnf("[REMOVE-DEVBOX-TRACE] devbox snapshot bucket for key %s does not exist", Key)
 			return errdefs.ErrNotFound
 		}
 		contentID := sbkt.Get(DevboxKeyContentID)
 		mountPath = string(sbkt.Get(DevboxKeyPath))
+
+		log.G(ctx).WithFields(log.Fields{
+			"key":             Key,
+			"contentID":       string(contentID),
+			"mountPath":       mountPath,
+			"mountPath_empty": mountPath == "",
+		}).Warnf("[REMOVE-DEVBOX-TRACE] Retrieved fields from snapshot bucket")
 		if len(contentID) == 0 {
 			// fmt.Printf("content ID for key %s is empty, continuing with snapshotter removal\n", Key)
 			return nil // if contentID is nil, continue with the snapshotter removal

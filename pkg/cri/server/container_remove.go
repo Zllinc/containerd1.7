@@ -103,6 +103,11 @@ func (c *criService) RemoveContainer(ctx context.Context, r *runtime.RemoveConta
 	// so we don't need the "Dead" state for now.
 
 	// Delete containerd container.
+	log.G(ctx).WithFields(logrus.Fields{
+		"container_id": id,
+		"snapshot_key": i.SnapshotKey,
+		"snapshotter":  i.Snapshotter,
+	}).Warnf("[CONTAINER-REMOVE-TRACE] About to call container.Container.Delete with WithSnapshotCleanup")
 	if err := container.Container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return nil, fmt.Errorf("failed to delete containerd container %q: %w", id, err)

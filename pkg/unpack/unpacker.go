@@ -65,6 +65,7 @@ type unpackerConfig struct {
 
 	limiter               *semaphore.Weighted
 	duplicationSuppressor kmutex.KeyedLocker
+	flatten               bool
 }
 
 // Platform represents a platform-specific unpack configuration which includes
@@ -117,6 +118,14 @@ func WithLimiter(l *semaphore.Weighted) UnpackerOpt {
 func WithDuplicationSuppressor(d kmutex.KeyedLocker) UnpackerOpt {
 	return UnpackerOpt(func(c *unpackerConfig) error {
 		c.duplicationSuppressor = d
+		return nil
+	})
+}
+
+// WithFlattenUnpack enables flatten-unpack behavior for this unpacker.
+func WithFlattenUnpack() UnpackerOpt {
+	return UnpackerOpt(func(c *unpackerConfig) error {
+		c.flatten = true
 		return nil
 	})
 }
@@ -406,6 +415,95 @@ func (u *Unpacker) unpack(
 		return nil
 	}
 
+	if u.flatten {
+		finalChainID := identity.ChainID(diffIDs).String()
+		unlock, err := u.lockSnChainID(ctx, finalChainID, unpack.SnapshotterKey)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+
+		if _, err := sn.Stat(ctx, finalChainID); err == nil {
+			chain = append(chain[:0], diffIDs...)
+			goto setRootRef
+		} else if !errdefs.IsNotFound(err) {
+			return fmt.Errorf("failed to stat snapshot %s: %w", finalChainID, err)
+		}
+
+		snapshotLabels := map[string]string{
+			labelSnapshotRef: finalChainID,
+		}
+		opts := append(unpack.SnapshotOpts, snapshots.WithLabels(snapshotLabels))
+
+		var (
+			key    string
+			mounts []mount.Mount
+		)
+		for try := 1; try <= 3; try++ {
+			key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), finalChainID)
+			mounts, err = sn.Prepare(ctx, key, "", opts...)
+			if err != nil {
+				if errdefs.IsAlreadyExists(err) {
+					continue
+				}
+				return fmt.Errorf("failed to prepare extraction snapshot %q: %w", key, err)
+			}
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("unable to prepare extraction snapshot: %w", err)
+		}
+
+		abort := func(ctx context.Context) {
+			if err := sn.Remove(ctx, key); err != nil {
+				log.G(ctx).WithError(err).Errorf("failed to cleanup %q", key)
+			}
+		}
+		cleanupOnErr := true
+		defer func() {
+			if cleanupOnErr {
+				cleanup.Do(ctx, abort)
+			}
+		}()
+
+		if err := u.fetch(ctx, h, layers, nil); err != nil {
+			return err
+		}
+
+		for i, desc := range layers {
+			diff, err := a.Apply(ctx, desc, mounts, unpack.ApplyOpts...)
+			if err != nil {
+				return fmt.Errorf("failed to extract layer %s: %w", diffIDs[i], err)
+			}
+			if diff.Digest != diffIDs[i] {
+				return fmt.Errorf("wrong diff id calculated on extraction %q", diffIDs[i])
+			}
+
+			cinfo := content.Info{
+				Digest: desc.Digest,
+				Labels: map[string]string{
+					labels.LabelUncompressed: diff.Digest.String(),
+				},
+			}
+			if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
+				return err
+			}
+		}
+
+		if err = sn.Commit(ctx, finalChainID, key, opts...); err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				cleanupOnErr = false
+				_ = sn.Remove(ctx, key)
+				chain = append(chain[:0], diffIDs...)
+				goto setRootRef
+			}
+			return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
+		}
+		cleanupOnErr = false
+		chain = append(chain[:0], diffIDs...)
+		goto setRootRef
+	}
+
 	for i, desc := range layers {
 		_, layerSpan := tracing.StartSpan(ctx, tracing.Name(unpackSpanPrefix, "unpackLayer"))
 		unpackLayerStart := time.Now()
@@ -426,6 +524,7 @@ func (u *Unpacker) unpack(
 		}).Debug("layer unpacked")
 	}
 
+setRootRef:
 	chainID := identity.ChainID(chain).String()
 	cinfo := content.Info{
 		Digest: config.Digest,

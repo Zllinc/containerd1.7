@@ -79,6 +79,78 @@ func ApplyLayersWithOpts(ctx context.Context, layers []Layer, sn snapshots.Snaps
 	return chainID, nil
 }
 
+// ApplyLayersFlattenWithOpts applies all layers onto a single snapshot and
+// commits only the final chain ID. This is used for "flatten" unpack.
+func ApplyLayersFlattenWithOpts(ctx context.Context, layers []Layer, sn snapshots.Snapshotter, a diff.Applier, opts []snapshots.Opt, applyOpts []diff.ApplyOpt) (digest.Digest, bool, error) {
+	if len(layers) == 0 {
+		return "", false, nil
+	}
+
+	chain := make([]digest.Digest, len(layers))
+	for i, layer := range layers {
+		chain[i] = layer.Diff.Digest
+	}
+	chainID := identity.ChainID(chain)
+
+	if _, err := sn.Stat(ctx, chainID.String()); err == nil {
+		return chainID, false, nil
+	} else if !errdefs.IsNotFound(err) {
+		return "", false, fmt.Errorf("failed to stat snapshot %s: %w", chainID, err)
+	}
+
+	var (
+		key    string
+		mounts []mount.Mount
+		err    error
+	)
+
+	for {
+		key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), chainID)
+		mounts, err = sn.Prepare(ctx, key, "", opts...)
+		if err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				continue
+			}
+			return "", false, fmt.Errorf("failed to prepare extraction snapshot %q: %w", key, err)
+		}
+		break
+	}
+
+	defer func() {
+		if err != nil {
+			if !errdefs.IsAlreadyExists(err) {
+				log.G(ctx).WithError(err).WithField("key", key).Infof("apply failure, attempting cleanup")
+			}
+			if rerr := sn.Remove(ctx, key); rerr != nil {
+				log.G(ctx).WithError(rerr).WithField("key", key).Warnf("extraction snapshot removal failed")
+			}
+		}
+	}()
+
+	for _, layer := range layers {
+		diffDesc, applyErr := a.Apply(ctx, layer.Blob, mounts, applyOpts...)
+		if applyErr != nil {
+			err = fmt.Errorf("failed to extract layer %s: %w", layer.Diff.Digest, applyErr)
+			return "", false, err
+		}
+		if diffDesc.Digest != layer.Diff.Digest {
+			err = fmt.Errorf("wrong diff id calculated on extraction %q", diffDesc.Digest)
+			return "", false, err
+		}
+	}
+
+	if err = sn.Commit(ctx, chainID.String(), key, opts...); err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			_ = sn.Remove(ctx, key)
+			return chainID, false, nil
+		}
+		err = fmt.Errorf("failed to commit snapshot %s: %w", key, err)
+		return "", false, err
+	}
+
+	return chainID, true, nil
+}
+
 // ApplyLayer applies a single layer on top of the given provided layer chain,
 // using the provided snapshotter and applier. If the layer was unpacked true
 // is returned, if the layer already exists false is returned.

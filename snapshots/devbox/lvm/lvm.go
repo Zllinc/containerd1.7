@@ -636,6 +636,27 @@ func CreateSnapshot(ctx context.Context, snap *apis.LVMSnapshot) error {
 
 }
 
+// CreateThinSnapshotRW creates a writable thin snapshot for a given LV.
+// snapName should be a valid LVM LV name and must be unique within the VG.
+func CreateThinSnapshotRW(ctx context.Context, vgName, originLV, snapName string) error {
+	if vgName == "" || originLV == "" || snapName == "" {
+		return fmt.Errorf("vgName, originLV, and snapName cannot be empty")
+	}
+	originPath := DevPath + vgName + "/" + originLV
+	args := []string{
+		"--snapshot",
+		"--name", snapName,
+		originPath,
+	}
+	out, _, err := RunCommandSplit(ctx, LVCreate, args...)
+	if err != nil {
+		klog.Errorf("lvm: could not create writable thin snapshot %s from %s cmd %v error: %s", snapName, originLV, args, string(out))
+		return err
+	}
+	klog.Infof("created writable thin snapshot %s from %s", snapName, originLV)
+	return nil
+}
+
 // DestroySnapshot deletes the lvm volume snapshot
 func DestroySnapshot(ctx context.Context, snap *apis.LVMSnapshot) error {
 	snapVolume := snap.Spec.VolGroup + "/" + getLVMSnapName(snap.Name)
@@ -1177,8 +1198,14 @@ func lvThinExists(ctx context.Context, vg string, name string) bool {
 // snapshotExists checks if a snapshot volume exists for the given volumegroup
 // and snapshot name.
 func isSnapshotExists(ctx context.Context, vg, snapVolumeName string) (bool, error) {
-	out, _, err := RunCommandSplit(ctx, "lvs", vg+"/"+snapVolumeName, "--noheadings", "-o", "lv_name")
+	out, stderr, err := RunCommandSplit(ctx, "lvs", vg+"/"+snapVolumeName, "--noheadings", "-o", "lv_name")
 	if err != nil {
+		// Check if the error is because the snapshot doesn't exist
+		// lvs returns exit status 5 with "Failed to find logical volume" when LV doesn't exist
+		errStr := strings.ToLower(string(stderr))
+		if strings.Contains(errStr, "failed to find logical volume") || strings.Contains(errStr, "not found") {
+			return false, nil
+		}
 		return false, err
 	}
 	return snapVolumeName == strings.TrimSpace(string(out)), nil
@@ -1238,4 +1265,183 @@ func removeVolumeFilesystem(lvmVolume *apis.LVMVolume) error {
 	}
 	klog.V(4).Infof("Successfully wiped filesystem on device path: %s", devicePath)
 	return nil
+}
+
+// Devbox LVM snapshot helper functions
+
+const (
+	// Devbox snapshot suffix
+	devboxSnapshotSuffix = "-snapshot"
+	// DefaultSnapshotSize is the default size for Devbox snapshots in GB
+	DefaultSnapshotSize = 10
+)
+
+// CreateDevboxLVSnapshot creates a snapshot for Devbox LV with simplified parameters.
+// The snapshot name will be "<lvName>snapshot" and size will be 10GB.
+//
+// Parameters:
+//   - ctx: context
+//   - vgName: volume group name
+//   - lvName: the name of the LV to snapshot (without VG prefix)
+//
+// Returns:
+//   - string: the full path of the snapshot (vg/<lvName>snapshot)
+//   - error: error message
+func CreateDevboxLVSnapshot(ctx context.Context, vgName, lvName string) (string, error) {
+	if vgName == "" {
+		return "", errors.New("vgName cannot be empty")
+	}
+	if lvName == "" {
+		return "", errors.New("lvName cannot be empty")
+	}
+
+	// build LVMSnapshot object
+	// Note: For thin snapshots, we don't specify SnapSize to let LVM create a true thin snapshot
+	// that uses the thin pool for storage. If SnapSize is specified, LVM may create a regular snapshot.
+	snap := &apis.LVMSnapshot{
+		Spec: apis.LVMSnapshotSpec{
+			OwnerNodeID: "devbox",
+			VolGroup:    vgName,
+			// SnapSize is intentionally not set to create a thin snapshot
+			// Thin snapshots automatically use space from the thin pool
+		},
+	}
+
+	// use snapshot name: lvName + "snapshot"
+	// note: LVM requires snapshot name to not start with "snapshot-" (reserved word)
+	// so we directly add "snapshot" suffix to lvName
+	snap.Name = lvName + devboxSnapshotSuffix
+
+	// set Labels, used to identify the original LV
+	if snap.Labels == nil {
+		snap.Labels = make(map[string]string)
+	}
+	snap.Labels[LVMVolKey] = lvName
+
+	// call CreateSnapshot function
+	if err := CreateSnapshot(ctx, snap); err != nil {
+		return "", errors.Wrapf(err, "failed to create snapshot for LV %s", lvName)
+	}
+
+	snapshotPath := fmt.Sprintf("%s/%s", vgName, snap.Name)
+	klog.Infof("Created Devbox snapshot: %s from LV: %s", snapshotPath, lvName)
+
+	return snapshotPath, nil
+}
+
+// DestroyDevboxLVSnapshot destroys a Devbox LV snapshot.
+// The snapshot name is automatically generated as "<lvName>snapshot".
+//
+// Parameters:
+//   - ctx: context
+//   - vgName: volume group name
+//   - lvName: the original LV name (without VG prefix)
+//
+// Returns:
+//   - error: error message
+func DestroyDevboxLVSnapshot(ctx context.Context, vgName, lvName string) error {
+	if vgName == "" {
+		return errors.New("vgName cannot be empty")
+	}
+	if lvName == "" {
+		return errors.New("lvName cannot be empty")
+	}
+
+	// build LVMSnapshot object
+	snap := &apis.LVMSnapshot{
+		Spec: apis.LVMSnapshotSpec{
+			OwnerNodeID: "devbox",
+			VolGroup:    vgName,
+		},
+	}
+
+	// use snapshot name: lvName + "snapshot"
+	snap.Name = lvName + devboxSnapshotSuffix
+
+	// set Labels, used to identify the original LV
+	if snap.Labels == nil {
+		snap.Labels = make(map[string]string)
+	}
+	snap.Labels[LVMVolKey] = lvName
+
+	// call DestroySnapshot function
+	if err := DestroySnapshot(ctx, snap); err != nil {
+		return errors.Wrapf(err, "failed to destroy snapshot for LV %s", lvName)
+	}
+
+	klog.Infof("Destroyed Devbox snapshot: %s", lvName)
+	return nil
+}
+
+// CheckDevboxSnapshotExists checks if a Devbox snapshot exists.
+//
+// Parameters:
+//   - ctx: context
+//   - vgName: volume group name
+//   - lvName: the original LV name (without VG prefix)
+//
+// Returns:
+//   - bool: true if snapshot exists, false otherwise
+//   - error: error message
+func CheckDevboxSnapshotExists(ctx context.Context, vgName, lvName string) (bool, error) {
+	if vgName == "" {
+		return false, errors.New("vgName cannot be empty")
+	}
+	if lvName == "" {
+		return false, errors.New("lvName cannot be empty")
+	}
+
+	// snapshot name: lvName + "snapshot"
+	snapshotName := lvName + devboxSnapshotSuffix
+
+	// call isSnapshotExists function
+	return isSnapshotExists(ctx, vgName, snapshotName)
+}
+
+// GetDevboxSnapshotDataPercent gets the data usage percentage of a Devbox snapshot.
+//
+// Parameters:
+//   - ctx: context
+//   - vgName: volume group name
+//   - lvName: the original LV name (without VG prefix)
+//
+// Returns:
+//   - float64: data usage percentage (0-100)
+//   - error: error message
+func GetDevboxSnapshotDataPercent(ctx context.Context, vgName, lvName string) (float64, error) {
+	if vgName == "" {
+		return 0, errors.New("vgName cannot be empty")
+	}
+	if lvName == "" {
+		return 0, errors.New("lvName cannot be empty")
+	}
+
+	// snapshot name: lvName + "snapshot"
+	snapshotName := lvName + devboxSnapshotSuffix
+	snapshotLVPath := fmt.Sprintf("%s/%s", vgName, snapshotName)
+
+	// use lvs command to get data_percent
+	args := []string{
+		"-o", "data_percent",
+		"--noheadings",
+		"--nosuffix",
+		snapshotLVPath,
+	}
+
+	output, _, err := RunCommandSplit(ctx, LVList, args...)
+	if err != nil {
+		return 0, errors.Wrap(err, "failed to get snapshot data percent")
+	}
+
+	// parse percentage
+	percentStr := strings.TrimSpace(string(output))
+	percentStr = strings.TrimSuffix(percentStr, "%")
+
+	var percent float64
+	_, err = fmt.Sscanf(percentStr, "%f", &percent)
+	if err != nil {
+		return 0, errors.Wrapf(err, "failed to parse data percent: %s", percentStr)
+	}
+
+	return percent, nil
 }

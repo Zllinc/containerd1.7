@@ -316,6 +316,9 @@ type UnpackConfig struct {
 	// in-flight fetch request or unpack handler for a given descriptor's
 	// digest or chain ID.
 	DuplicationSuppressor kmutex.KeyedLocker
+	// Flatten indicates whether to apply all layers to a single snapshot
+	// and commit only the final chain ID.
+	Flatten bool
 }
 
 // UnpackOpt provides configuration for unpack
@@ -341,6 +344,22 @@ func WithUnpackDuplicationSuppressor(suppressor kmutex.KeyedLocker) UnpackOpt {
 func WithUnpackApplyOpts(opts ...diff.ApplyOpt) UnpackOpt {
 	return func(ctx context.Context, uc *UnpackConfig) error {
 		uc.ApplyOpts = append(uc.ApplyOpts, opts...)
+		return nil
+	}
+}
+
+// WithUnpackSnapshotOpts appends new snapshot options on the UnpackConfig.
+func WithUnpackSnapshotOpts(opts ...snapshots.Opt) UnpackOpt {
+	return func(ctx context.Context, uc *UnpackConfig) error {
+		uc.SnapshotOpts = append(uc.SnapshotOpts, opts...)
+		return nil
+	}
+}
+
+// WithFlattenUnpack enables flatten-unpack behavior.
+func WithFlattenUnpack() UnpackOpt {
+	return func(ctx context.Context, uc *UnpackConfig) error {
+		uc.Flatten = true
 		return nil
 	}
 }
@@ -390,27 +409,52 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		}
 	}
 
-	for _, layer := range layers {
-		unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
+	if config.Flatten {
+		chainID, applied, err := rootfs.ApplyLayersFlattenWithOpts(ctx, layers, sn, a, config.SnapshotOpts, config.ApplyOpts)
 		if err != nil {
 			return err
 		}
-
-		if unpacked {
-			// Set the uncompressed label after the uncompressed
-			// digest has been verified through apply.
-			cinfo := content.Info{
-				Digest: layer.Blob.Digest,
-				Labels: map[string]string{
-					labels.LabelUncompressed: layer.Diff.Digest.String(),
-				},
-			}
-			if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
-				return err
+		if applied {
+			for _, layer := range layers {
+				cinfo := content.Info{
+					Digest: layer.Blob.Digest,
+					Labels: map[string]string{
+						labels.LabelUncompressed: layer.Diff.Digest.String(),
+					},
+				}
+				if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
+					return err
+				}
 			}
 		}
+		chain = nil
+		for _, layer := range layers {
+			chain = append(chain, layer.Diff.Digest)
+		}
+		_ = chainID
+	} else {
+		for _, layer := range layers {
+			unpacked, err = rootfs.ApplyLayerWithOpts(ctx, layer, chain, sn, a, config.SnapshotOpts, config.ApplyOpts)
+			if err != nil {
+				return err
+			}
 
-		chain = append(chain, layer.Diff.Digest)
+			if unpacked {
+				// Set the uncompressed label after the uncompressed
+				// digest has been verified through apply.
+				cinfo := content.Info{
+					Digest: layer.Blob.Digest,
+					Labels: map[string]string{
+						labels.LabelUncompressed: layer.Diff.Digest.String(),
+					},
+				}
+				if _, err := cs.Update(ctx, cinfo, "labels."+labels.LabelUncompressed); err != nil {
+					return err
+				}
+			}
+
+			chain = append(chain, layer.Diff.Digest)
+		}
 	}
 
 	desc, err := i.i.Config(ctx, cs, i.platform)

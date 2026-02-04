@@ -20,6 +20,8 @@ package devbox
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -52,6 +54,7 @@ const upperdirKey = "containerd.io/snapshot/overlay.upperdir"
 
 const newLayerLimitKey = "containerd.io/snapshot/devbox-storage-limit"
 const devboxContentIDKey = "containerd.io/snapshot/devbox-content-id"
+const devboxLvmRootfsKey = "containerd.io/snapshot/devbox-lvm-rootfs"
 const privateImageKey = "containerd.io/snapshot/devbox-init"
 const removeContentIDKey = "containerd.io/snapshot/devbox-remove-content-id"
 const unmountLvm = "containerd.io/snapshot/devbox-unmount-lvm"
@@ -315,6 +318,10 @@ func (o *Snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // This can be used to recover mounts after calling View or Prepare.
 func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, err error) {
 	var s storage.Snapshot
+	var (
+		lvName    string
+		lvmRootfs bool
+	)
 	if err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
 		var (
 			contentID string
@@ -325,12 +332,21 @@ func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 			return fmt.Errorf("failed to get devbox content ID for snapshot %s: %w", key, err)
 		}
 		if contentID != "" {
-			lvName, err := storage.GetDevboxLvName(ctx, contentID, key)
+			// The devbox content mapping is keyed by contentID and may keep an
+			// "active" snapshot key. For committed snapshots the name changes, so
+			// do not enforce snapshot-key equality here.
+			lvName, err = storage.GetDevboxLvName(ctx, contentID, "")
 			if err != nil {
 				return fmt.Errorf("failed to get devbox logical volume name for content ID %s: %w", contentID, err)
 			}
 			if lvName == "" {
 				return fmt.Errorf("logical volume name for content ID %s is empty", contentID)
+			}
+		}
+
+		if _, info, _, infoErr := storage.GetInfo(ctx, key); infoErr == nil {
+			if info.Labels[devboxLvmRootfsKey] == "true" {
+				lvmRootfs = true
 			}
 		}
 
@@ -342,23 +358,74 @@ func (o *Snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 	}); err != nil {
 		return nil, err
 	}
+	if lvmRootfs {
+		if lvName == "" {
+			return nil, fmt.Errorf("logical volume name is empty for LVM rootfs snapshot %s", key)
+		}
+		roFlag := "rw"
+		if s.Kind == snapshots.KindView {
+			roFlag = "ro"
+		}
+		return []mount.Mount{
+			{
+				Source:  fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName),
+				Type:    "ext4",
+				Options: []string{roFlag},
+			},
+		}, nil
+	}
 	return o.mounts(s), nil
 }
 
 func (o *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
 		// grab the existing id
-		id, _, _, err := storage.GetInfo(ctx, key)
+		id, info, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return err
 		}
 
-		usage, err := fs.DiskUsage(ctx, o.upperPath(id))
-		if err != nil {
-			return err
+		var usage snapshots.Usage
+		if info.Labels[devboxLvmRootfsKey] == "true" {
+			contentID, _, err := storage.GetSnapshotDevboxInfo(ctx, key)
+			if err != nil {
+				return fmt.Errorf("failed to get devbox content ID for snapshot %s: %w", key, err)
+			}
+			if contentID == "" {
+				return fmt.Errorf("content ID is empty for LVM rootfs snapshot %s", key)
+			}
+			// Do not enforce snapshot-key equality for committed snapshots.
+			lvName, err := storage.GetDevboxLvName(ctx, contentID, "")
+			if err != nil {
+				return fmt.Errorf("failed to get devbox logical volume name for content ID %s: %w", contentID, err)
+			}
+			devicePath := fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName)
+			mounts := []mount.Mount{
+				{
+					Source:  devicePath,
+					Type:    "ext4",
+					Options: []string{"ro"},
+				},
+			}
+			if err := mount.WithTempMount(ctx, mounts, func(root string) error {
+				du, err := fs.DiskUsage(ctx, root)
+				if err != nil {
+					return err
+				}
+				usage = snapshots.Usage(du)
+				return nil
+			}); err != nil {
+				return err
+			}
+		} else {
+			du, err := fs.DiskUsage(ctx, o.upperPath(id))
+			if err != nil {
+				return err
+			}
+			usage = snapshots.Usage(du)
 		}
 
-		if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
+		if _, err = storage.CommitActive(ctx, key, name, usage, opts...); err != nil {
 			return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
 		}
 		return nil
@@ -773,6 +840,7 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	var (
 		s                       storage.Snapshot
 		td, path, npath, lvName string
+		lvmRootfs               bool
 	)
 
 	defer func() {
@@ -812,6 +880,22 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			}
 		}
 
+		lvmRootfs = base.Labels[devboxLvmRootfsKey] == "true"
+		if !lvmRootfs && parent != "" {
+			if _, info, _, infoErr := storage.GetInfo(ctx, parent); infoErr == nil {
+				if info.Labels[devboxLvmRootfsKey] == "true" {
+					lvmRootfs = true
+				}
+			}
+		}
+		if lvmRootfs {
+			if base.Labels == nil {
+				base.Labels = map[string]string{}
+			}
+			base.Labels[devboxLvmRootfsKey] = "true"
+			opts = append(opts, snapshots.WithLabels(base.Labels))
+		}
+
 		s, err = storage.CreateSnapshot(ctx, kind, key, directParent, opts...)
 		if err != nil {
 			return fmt.Errorf("failed to create snapshot: %w", err)
@@ -820,6 +904,46 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		log.G(ctx).Debug("Created snapshot:", s.ID)
 		npath = filepath.Join(snapshotDir, s.ID) // use npath instead of path to avoid removing the directory before create
 		log.G(ctx).Debug("Snapshot directory path:", npath)
+
+		if lvmRootfs {
+			if err := os.MkdirAll(npath, 0755); err != nil {
+				return fmt.Errorf("failed to create snapshot directory %s: %w", npath, err)
+			}
+
+			if contentID == "" {
+				contentID = key
+			}
+			lvName = lvNameFromKey(contentID)
+			if parent == "" {
+				if useLimit == "" {
+					return fmt.Errorf("missing %s for LVM rootfs snapshot %s", newLayerLimitKey, key)
+				}
+				if err := o.createLvmRootfsVolume(ctx, lvName, useLimit); err != nil {
+					return err
+				}
+			} else {
+				parentContentID, _, err := storage.GetSnapshotDevboxInfo(ctx, parent)
+				if err != nil {
+					return fmt.Errorf("failed to get parent devbox info for snapshot %s: %w", parent, err)
+				}
+				if parentContentID == "" {
+					return fmt.Errorf("parent content ID is empty for snapshot %s", parent)
+				}
+				parentLvName, err := storage.GetDevboxLvName(ctx, parentContentID, "")
+				if err != nil {
+					return fmt.Errorf("failed to get parent logical volume name for content ID %s: %w", parentContentID, err)
+				}
+				if err := o.createLvmRootfsSnapshot(ctx, parentLvName, lvName); err != nil {
+					return err
+				}
+			}
+
+			if err := storage.SetDevboxContent(ctx, key, contentID, lvName, npath); err != nil {
+				return fmt.Errorf("failed to set devbox content: %w", err)
+			}
+			path = npath
+			return nil
+		}
 
 		if idOk && limitOk {
 			var notExistErr error
@@ -954,6 +1078,22 @@ func (o *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
+	if lvmRootfs {
+		if lvName == "" {
+			return nil, fmt.Errorf("logical volume name is empty for LVM rootfs snapshot %s", key)
+		}
+		roFlag := "rw"
+		if kind == snapshots.KindView {
+			roFlag = "ro"
+		}
+		return []mount.Mount{
+			{
+				Source:  fmt.Sprintf("/dev/%s/%s", o.lvmVgName, lvName),
+				Type:    "ext4",
+				Options: []string{roFlag},
+			},
+		}, nil
+	}
 	return o.mounts(s), nil
 }
 
@@ -1006,6 +1146,42 @@ func parseUseLimit(useLimit string) (string, error) {
 	capacity *= multipliers
 	return strconv.Itoa(capacity), nil
 
+}
+
+func lvNameFromKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return "devbox-" + hex.EncodeToString(sum[:12])
+}
+
+func (o *Snapshotter) createLvmRootfsVolume(ctx context.Context, lvName, useLimit string) error {
+	capacity, err := parseUseLimit(useLimit)
+	if err != nil {
+		return fmt.Errorf("failed to parse use limit %s: %w", useLimit, err)
+	}
+	vol := &apis.LVMVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: lvName,
+		},
+		Spec: apis.VolumeInfo{
+			Capacity:      capacity,
+			VolGroup:      o.lvmVgName,
+			ThinProvision: o.ThinPoolName,
+		},
+	}
+	if err := lvm.CreateVolume(ctx, vol); err != nil {
+		return fmt.Errorf("failed to create LVM logical volume %s: %w", lvName, err)
+	}
+	if err := o.mkfs(lvName); err != nil {
+		return fmt.Errorf("failed to create filesystem on LVM logical volume %s: %w", lvName, err)
+	}
+	return nil
+}
+
+func (o *Snapshotter) createLvmRootfsSnapshot(ctx context.Context, parentLV, lvName string) error {
+	if err := lvm.CreateThinSnapshotRW(ctx, o.lvmVgName, parentLV, lvName); err != nil {
+		return fmt.Errorf("failed to create LVM snapshot %s from %s: %w", lvName, parentLV, err)
+	}
+	return nil
 }
 
 func (o *Snapshotter) removeLv(ctx context.Context, lvName string) error {

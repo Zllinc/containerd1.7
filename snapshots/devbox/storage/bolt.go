@@ -382,6 +382,20 @@ func CommitActive(ctx context.Context, key, name string, usage snapshots.Usage, 
 			return fmt.Errorf("failed to get active snapshot %q: %w", key, errdefs.ErrNotFound)
 		}
 
+		// Preserve devbox-specific metadata stored in the snapshot bucket.
+		// These keys are written by the devbox snapshotter (e.g. contentID/LV mapping),
+		// and must survive the "active key -> committed name" rename.
+		if v := sbkt.Get(DevboxKeyContentID); v != nil {
+			if err := dbkt.Put(DevboxKeyContentID, v); err != nil {
+				return fmt.Errorf("failed to preserve devbox contentID for snapshot %q: %w", key, err)
+			}
+		}
+		if v := sbkt.Get(DevboxKeyPath); v != nil {
+			if err := dbkt.Put(DevboxKeyPath, v); err != nil {
+				return fmt.Errorf("failed to preserve devbox path for snapshot %q: %w", key, err)
+			}
+		}
+
 		var si snapshots.Info
 		if err := readSnapshot(sbkt, &id, &si); err != nil {
 			return fmt.Errorf("failed to read active snapshot %q: %w", key, err)
